@@ -1,0 +1,6 @@
+# Large binary files — use git-lfs for PDFs if needed
+# *.pdf
+
+*.pyc
+__pycache__/
+.DS_Store

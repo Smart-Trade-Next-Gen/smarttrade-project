@@ -1,0 +1,982 @@
+{
+  "system_design": {
+    "overview": "Implement a complete Option Chain feature for SmartTrade platform enabling traders to view live option chains, calculate and visualize Greeks (Delta, Gamma, Theta, Vega), track IV Rank/Percentile, build multi-leg option strategies, and calculate P&L for strategy positions. Architecture extends existing microservices pattern with a new Options Chain Service handling data aggregation, calculation, and streaming.",
+    "tech_stack": [
+      "Backend: FastAPI 0.104+",
+      "Database: PostgreSQL 15+ with asyncpg",
+      "ORM: SQLAlchemy 2.0+ (async)",
+      "Event Bus: Redis 7.0+",
+      "Cache: Redis (in-memory)",
+      "Broker API: Fyers WebSocket + REST",
+      "Computation: NumPy, SciPy (Black-Scholes, Greeks calculation)",
+      "Frontend: React 18+, TypeScript",
+      "State Management: Zustand",
+      "WebSocket: WebSocket asyncio (backend), browser WebSocket (frontend)",
+      "Charts: lightweight-charts",
+      "Testing: pytest (backend), Vitest (frontend)"
+    ],
+    "architecture_pattern": "Microservices with Event-Driven Architecture. New Options Chain Service (OCS) coordinates option data from Broker Adapter Service (BAS), performs Greeks calculations, manages IV history, and publishes domain events. Frontend subscribes to WebSocket stream for real-time updates.",
+    "modules": [
+      {
+        "name": "Options Chain Service (OCS)",
+        "responsibility": "Core service handling option chain aggregation, Greeks calculation, IV metrics, strategy validation, and WebSocket streaming for live option data",
+        "dependencies": [
+          "Broker Adapter Service (REST API for static data)",
+          "Market Data Service (WebSocket for underlying price updates)",
+          "Redis (event bus and caching)",
+          "PostgreSQL (option data persistence)",
+          "smarttrade-common (shared utilities)"
+        ]
+      },
+      {
+        "name": "Greeks Calculator Engine",
+        "responsibility": "Compute and cache Delta, Gamma, Theta, Vega using Black-Scholes model; handle volatility surface interpolation and edge cases",
+        "dependencies": [
+          "NumPy, SciPy",
+          "Cache layer (Redis)",
+          "Options Chain Service"
+        ]
+      },
+      {
+        "name": "IV Rank & Percentile Engine",
+        "responsibility": "Calculate IV Rank (current IV vs 52-week range) and IV Percentile (historical IV percentile) for all strikes; maintain rolling IV history",
+        "dependencies": [
+          "PostgreSQL (IV history table)",
+          "Options Chain Service",
+          "Market Data Service"
+        ]
+      },
+      {
+        "name": "Option Strategy Builder",
+        "responsibility": "Validate multi-leg option strategies (spreads, straddles, strangles, etc.), compute combined Greeks, calculate max profit/loss/risk, generate P&L payoff curves",
+        "dependencies": [
+          "Greeks Calculator Engine",
+          "Options Chain Service",
+          "DB (strategy templates)"
+        ]
+      },
+      {
+        "name": "Option P&L Calculator",
+        "responsibility": "Calculate real-time P&L for open option positions and strategies based on current market prices; support Greeks-based P&L attribution",
+        "dependencies": [
+          "Greeks Calculator Engine",
+          "Options Chain Service",
+          "Portfolio data from BAS"
+        ]
+      },
+      {
+        "name": "Frontend Option Chain Components",
+        "responsibility": "React components for option chain table, Greeks heatmap, strategy builder UI, P&L visualization, and real-time price updates",
+        "dependencies": [
+          "Zustand (state management)",
+          "WebSocket client",
+          "lightweight-charts (P&L payoff curve visualization)"
+        ]
+      },
+      {
+        "name": "WebSocket Aggregator for Options",
+        "responsibility": "Broadcast option chain updates, Greeks changes, and strategy P&L changes to connected frontend clients in real-time",
+        "dependencies": [
+          "Options Chain Service",
+          "Redis (pub/sub)",
+          "WebSocket server"
+        ]
+      }
+    ]
+  },
+  "execution_plan": [
+    {
+      "step": 1,
+      "title": "Create Options Chain Service Foundation & Database Schema",
+      "description": "Set up new FastAPI service (options-chain-service) with standard SmartTrade middleware, health probes, and create PostgreSQL schema for option chain data including option contracts, IV history, and strategy definitions.",
+      "inputs": "SmartTrade project structure, CLAUDE.md guidelines, PostgreSQL connection string",
+      "outputs": "New service directory, main.py, config.py, database models, initial migration",
+      "files_to_create": [
+        "options-chain-service/main.py",
+        "options-chain-service/config.py",
+        "options-chain-service/pyproject.toml",
+        "options-chain-service/src/models.py",
+        "options-chain-service/src/schemas.py",
+        "options-chain-service/src/database.py",
+        "options-chain-service/alembic/versions/0001_initial_schema.py",
+        "options-chain-service/.env.example"
+      ],
+      "files_to_modify": [
+        "docker-compose.yml (add OCS service)",
+        "docker-compose.local.yml (add OCS service)"
+      ],
+      "interfaces": [
+        "GET / (health check)",
+        "GET /ready (readiness probe)"
+      ],
+      "constraints": [
+        "Use async SQLAlchemy session pattern from smarttrade-common",
+        "Follow naming convention: snake_case for DB columns, PascalCase for Python models",
+        "Include created_at, updated_at, deleted_at timestamps on all tables",
+        "Option contracts table: symbol, expiry_date, strike_price, option_type (CE/PE), ltp, iv, bid, ask, oi, volume, greek_values (JSONB column for delta, gamma, theta, vega)",
+        "IV history table: symbol, strike_price, expiry_date, iv_value, timestamp, for historical lookback",
+        "Strategy templates table: strategy_name, legs (JSONB array with strike_offset, option_type, quantity, side)",
+        "Portfolio positions for options: symbol, expiry, strike, option_type, quantity, entry_price, current_price, pl, greeks (JSONB)"
+      ],
+      "acceptance_criteria": [
+        "Service starts on port 8006 without errors",
+        "Health check endpoints return 200 OK",
+        "Alembic migration applies successfully on clean DB",
+        "All tables created with correct columns and indexes",
+        "Async session pooling configured (echo=False in production)"
+      ]
+    },
+    {
+      "step": 2,
+      "title": "Implement Broker API Integration for Option Chain Data",
+      "description": "Create Fyers API client wrapper in OCS to fetch option chain data (all strikes for symbol/expiry), subscription handler for WebSocket option price updates, and caching layer to avoid redundant fetches.",
+      "inputs": "Fyers API docs, existing BAS Fyers integration patterns, smarttrade-common http_client module",
+      "outputs": "Option chain fetcher, Fyers WebSocket subscriber, caching decorator, integration tests",
+      "files_to_create": [
+        "options-chain-service/src/brokers/__init__.py",
+        "options-chain-service/src/brokers/fyers_client.py",
+        "options-chain-service/src/brokers/fyers_option_fetcher.py",
+        "options-chain-service/src/cache/__init__.py",
+        "options-chain-service/src/cache/option_cache.py",
+        "options-chain-service/tests/test_fyers_client.py",
+        "options-chain-service/tests/integration/test_option_fetcher.py"
+      ],
+      "files_to_modify": [
+        "smarttrade-common/src/http_client.py (add rate limiter for option chain requests if needed)"
+      ],
+      "interfaces": [
+        "FyersOptionChainFetcher.fetch_option_chain(symbol: str, expiry: str) -> List[OptionContract]",
+        "FyersOptionChainFetcher.subscribe_option_updates(symbol: str, expiry: str, callback: Callable)",
+        "OptionCache.get_chain(symbol: str, expiry: str) -> List[OptionContract] | None",
+        "OptionCache.set_chain(symbol: str, expiry: str, data: List[OptionContract], ttl: int = 60)"
+      ],
+      "constraints": [
+        "Cache TTL: 30 seconds for live option data (balance freshness vs API rate limits)",
+        "Retry logic: 3 retries with exponential backoff (use smarttrade-common resilience module)",
+        "Error handling: log and gracefully degrade if broker API fails",
+        "Fyers API returns: symbol, expiry_date, strike, option_type, ltp, iv, bid, ask, oi, volume, greeks (if available from broker)",
+        "If broker doesn't provide Greeks, mark as null (will be computed locally)",
+        "Thread-safe cache using asyncio locks"
+      ],
+      "acceptance_criteria": [
+        "Fetch option chain for NIFTY 50 index with 3+ expiries returns all strikes",
+        "Cache hit on second fetch within 30s window",
+        "Cache miss and refetch after TTL expires",
+        "WebSocket subscription receives price updates without blocking",
+        "Broker API errors logged with context, service continues operating",
+        "Unit tests cover happy path, error cases, cache expiry",
+        "Integration test fetches real data from Fyers (mock-friendly)"
+      ]
+    },
+    {
+      "step": 3,
+      "title": "Implement Greeks Calculator Engine (Black-Scholes)",
+      "description": "Build Greeks calculation module using Black-Scholes model to compute Delta, Gamma, Theta, Vega for all option strikes. Include volatility surface handling, dividend adjustment, and caching of computed values.",
+      "inputs": "Black-Scholes formula, implied volatility calculation method, risk-free rate data, dividend yield (if applicable)",
+      "outputs": "Greeks calculator module with unit tests, benchmark tests, caching layer",
+      "files_to_create": [
+        "options-chain-service/src/greeks/__init__.py",
+        "options-chain-service/src/greeks/calculator.py",
+        "options-chain-service/src/greeks/volatility_surface.py",
+        "options-chain-service/src/greeks/models.py",
+        "options-chain-service/tests/unit/test_greeks_calculator.py",
+        "options-chain-service/tests/unit/test_volatility_surface.py",
+        "options-chain-service/tests/performance/test_greeks_benchmark.py"
+      ],
+      "files_to_modify": []
+      "interfaces": [
+        "GreeksCalculator.compute_greeks(spot: float, strike: float, expiry: float (days), option_type: str ('CE'|'PE'), iv: float, risk_free_rate: float = 0.06, dividend_yield: float = 0.0) -> GreeksResult",
+        "GreeksResult (dataclass): delta, gamma, theta, vega, rho, as_of_timestamp",
+        "VolatilitySurface.interpolate(strike: float, days_to_expiry: float) -> float (implied vol)",
+        "GreeksCacheManager.get_cached(symbol: str, strike: float, option_type: str) -> GreeksResult | None",
+        "GreeksCacheManager.cache_greeks(symbol: str, strike: float, option_type: str, greeks: GreeksResult)"
+      ],
+      "constraints": [
+        "Use scipy.stats.norm for normal distribution (CDF, PDF)",
+        "Theta annualized to daily theta (divide by 365)",
+        "Vega per 1% IV change (divide by 100 if using IV as percentage)",
+        "Handle edge cases: ATM strike convergence, deep ITM/OTM, near-expiry (< 1 day)",
+        "Greek computation must complete in < 10ms per strike",
+        "Cache with Redis, invalidate on new market data (every 30s)",
+        "IV interpolation: use smile curve if multiple strikes available, else flat IV",
+        "Risk-free rate: fetch from config (typically 6% for India)",
+        "Dividend yield: 0 for indices, configurable per stock"
+      ],
+      "acceptance_criteria": [
+        "Delta values between -1 and 0 for PUT, 0 and 1 for CALL",
+        "Gamma always positive",
+        "Theta sign correct (positive for sellers, negative for buyers)",
+        "Vega always positive",
+        "ATM option delta ≈ 0.5 (CALL) or -0.5 (PUT)",
+        "Deep ITM CALL delta ≈ 1.0, PUT delta ≈ -1.0",
+        "Greeks computed for 100 strikes in < 500ms total",
+        "Cache returns consistent greeks for same inputs within 5s window",
+        "Unit tests cover: ATM, ITM, OTM, near-expiry, extreme IV scenarios",
+        "Performance test: 1000 iterations of compute_greeks < 5 seconds"
+      ]
+    },
+    {
+      "step": 4,
+      "title": "Implement IV Rank & IV Percentile Calculation Engine",
+      "description": "Build engine to calculate IV Rank (current IV / (52-week high IV - 52-week low IV)) and IV Percentile (% of historical IV values below current IV) for each strike. Store rolling IV history in database.",
+      "inputs": "Historical IV data (52-week lookback), current IV from Fyers",
+      "outputs": "IV metrics calculator, historical IV storage and retrieval, update job",
+      "files_to_create": [
+        "options-chain-service/src/iv_metrics/__init__.py",
+        "options-chain-service/src/iv_metrics/calculator.py",
+        "options-chain-service/src/iv_metrics/repository.py",
+        "options-chain-service/src/tasks/iv_history_update.py",
+        "options-chain-service/tests/unit/test_iv_metrics.py"
+      ],
+      "files_to_modify": [
+        "options-chain-service/alembic/versions/0002_add_iv_history_table.py (new migration)"
+      ],
+      "interfaces": [
+        "IVMetricsCalculator.calculate_iv_rank(symbol: str, strike: float, expiry: str, current_iv: float) -> float (0-100)",
+        "IVMetricsCalculator.calculate_iv_percentile(symbol: str, strike: float, expiry: str, current_iv: float) -> float (0-100)",
+        "IVHistoryRepository.store_iv_value(symbol: str, strike: float, expiry: str, option_type: str, iv: float, timestamp: datetime)",
+        "IVHistoryRepository.get_52week_range(symbol: str, strike: float, expiry: str, option_type: str) -> Tuple[float, float] (min_iv, max_iv)",
+        "IVHistoryRepository.get_historical_values(symbol: str, strike: float, expiry: str, days: int = 365) -> List[float]"
+      ],
+      "constraints": [
+        "IV Rank formula: (current_iv - min_52week_iv) / (max_52week_iv - min_52week_iv) * 100; return 0 if denominator = 0",
+        "IV Percentile: rank(current_iv in historical_values) / total_count * 100",
+        "Store IV values every 30 minutes minimum to avoid noise",
+        "Expire IV history after 18 months (to control DB size)",
+        "Handle missing IV values gracefully (skip, don't interpolate)",
+        "Partition IV history table by symbol and expiry for query performance",
+        "Concurrent updates to same strike/expiry must be serialized"
+      ],
+      "acceptance_criteria": [
+        "IV Rank returns 0-100 for any IV value within range",
+        "IV Rank returns 0 when current_iv < min, returns 100 when current_iv > max",
+        "IV Percentile matches manual calculation on sample data",
+        "52-week range correctly computed from DB history",
+        "Historical IV values retrieved in < 500ms for any symbol/strike",
+        "Null handling: return null if insufficient historical data (< 20 data points)",
+        "Daily background job updates IV history without service disruption",
+        "Unit tests cover: normal cases, edge cases (all same IV, single data point)"
+      ]
+    },
+    {
+      "step": 5,
+      "title": "Implement Option Strategy Builder & Validator",
+      "description": "Build validator and calculator for multi-leg option strategies (long call, long put, call spread, put spread, straddle, strangle, iron condor, etc.). Compute combined Greeks, max profit/loss, breakeven points, and risk/reward.",
+      "inputs": "Strategy definitions, leg configuration (strike_offset, option_type, quantity, side), current market prices",
+      "outputs": "Strategy validator, Greeks aggregator, P&L calculator, payoff diagram data",
+      "files_to_create": [
+        "options-chain-service/src/strategies/__init__.py",
+        "options-chain-service/src/strategies/models.py",
+        "options-chain-service/src/strategies/validator.py",
+        "options-chain-service/src/strategies/calculator.py",
+        "options-chain-service/src/strategies/payoff.py",
+        "options-chain-service/tests/unit/test_strategy_validator.py",
+        "options-chain-service/tests/unit/test_strategy_calculator.py"
+      ],
+      "files_to_modify": [
+        "options-chain-service/alembic/versions/0003_add_strategy_templates.py (migration for strategy templates)"
+      ],
+      "interfaces": [
+        "StrategyLeg (dataclass): symbol, expiry, strike, option_type, quantity, side ('buy'|'sell'), entry_price",
+        "Strategy (dataclass): name, legs: List[StrategyLeg], total_debit, total_credit, net_cost",
+        "StrategyValidator.validate_strategy(strategy: Strategy) -> ValidationResult",
+        "StrategyCalculator.compute_combined_greeks(strategy: Strategy) -> AggregatedGreeks",
+        "StrategyCalculator.calculate_max_profit_loss(strategy: Strategy) -> Tuple[float, float] (max_profit, max_loss)",
+        "StrategyCalculator.calculate_breakeven_points(strategy: Strategy) -> List[float]",
+        "PayoffDiagram.generate_payoff_curve(strategy: Strategy, spot_range: Tuple[float, float], num_points: int = 100) -> List[Tuple[float, float]] (spot_price, pl)"
+      ],
+      "constraints": [
+        "Validation rules: strike prices must exist in option chain, expiry must be in future, leg quantity >= 1",
+        "Combined Greeks: sum of individual Greeks weighted by quantity and side (buy +1, sell -1)",
+        "Max profit/loss: evaluate P&L across entire strike range, find global max/min",
+        "Breakeven: points where total P&L = 0 (solve numerically if needed)",
+        "Payoff curve: discrete evaluation from spot - 20% to spot + 20% or 100 points, whichever is finer",
+        "Support predefined strategy templates: long call, long put, bull call spread, bear put spread, straddle, strangle, iron condor, call ratio spread",
+        "Handle strategy legs with same underlying but different expiries"
+      ],
+      "acceptance_criteria": [
+        "Validator rejects strategies with non-existent strikes",
+        "Validator rejects strategies with past expiry dates",
+        "Combined delta equals sum of individual deltas (weighted)",
+        "Max profit/loss calculated correctly for known strategy examples (call spread: max profit = strike diff - net debit)",
+        "Breakeven calculated for long call = strike + premium",
+        "Payoff curve is continuous smooth function",
+        "Support 8+ predefined strategy templates",
+        "Unit tests cover: single leg, multi-leg, debit/credit spreads, complex strategies",
+        "Strategy calculation completes in < 100ms for any strategy with <= 4 legs"
+      ]
+    },
+    {
+      "step": 6,
+      "title": "Implement Option P&L Calculator for Positions & Strategies",
+      "description": "Build real-time P&L calculator for open option positions and strategies. Support Greeks-based attribution, scenario analysis, and mark-to-market valuation.",
+      "inputs": "Portfolio positions (from BAS), current market prices, Greeks, entry prices",
+      "outputs": "P&L calculator service, Greeks attribution model, scenario P&L",
+      "files_to_create": [
+        "options-chain-service/src/pnl/__init__.py",
+        "options-chain-service/src/pnl/calculator.py",
+        "options-chain-service/src/pnl/attribution.py",
+        "options-chain-service/src/pnl/scenario.py",
+        "options-chain-service/tests/unit/test_pnl_calculator.py"
+      ],
+      "files_to_modify": []
+      "interfaces": [
+        "PositionPnL (dataclass): symbol, option_type, strike, quantity, entry_price, current_price, unrealized_pl, realized_pl, pl_percentage",
+        "StrategyPnL (dataclass): strategy_name, total_pl, delta_pl, gamma_pl, theta_pl, vega_pl, net_pl",
+        "PnLCalculator.calculate_position_pnl(position: OptionPosition, current_price: float) -> PositionPnL",
+        "PnLCalculator.calculate_strategy_pnl(strategy: Strategy, current_prices: Dict[str, float]) -> StrategyPnL",
+        "PnLAttributor.attribute_greeks(strategy: Strategy, spot_move: float, iv_move: float) -> PnLAttribution",
+        "ScenarioPnL (dataclass): spot_price, iv_level, days_to_expiry, estimated_pl",
+        "ScenarioAnalyzer.scenario_analysis(strategy: Strategy, spot_scenarios: List[float], iv_scenarios: List[float]) -> List[ScenarioPnL]"
+      ],
+      "constraints": [
+        "P&L = (current_price - entry_price) * quantity for individual positions",
+        "For strategies, sum P&L across all legs",
+        "Greeks-based attribution: estimate P&L impact from delta, gamma, theta, vega separately",
+        "Delta P&L ≈ delta * quantity * spot_move",
+        "Gamma P&L ≈ 0.5 * gamma * quantity * spot_move^2",
+        "Theta P&L ≈ theta * quantity * (days_passed / 365)",
+        "Vega P&L ≈ vega * quantity * iv_move_bps / 100",
+        "Scenario P&L: recompute option prices at different spot/IV levels using Black-Scholes",
+        "Support intra-day scenarios (0.5 days to expiry change, for near-term positions)"
+      ],
+      "acceptance_criteria": [
+        "P&L calculation matches expected value for simple long call position",
+        "P&L calculation correct for multi-leg strategies (e.g., call spread)",
+        "Greeks attribution sums to approximately total P&L for small moves (< 5%)",
+        "Scenario analysis generates expected number of scenarios without errors",
+        "P&L updates in < 50ms when prices change",
+        "Negative P&L (loss) correctly represented",
+        "Unit tests cover: long positions, short positions, spreads, straddles, theta decay scenarios"
+      ]
+    },
+    {
+      "step": 7,
+      "title": "Create REST API Endpoints for Option Chain Data",
+      "description": "Implement FastAPI endpoints to expose option chain data, Greeks, IV metrics, strategy queries, and P&L calculations to frontend and other services.",
+      "inputs": "Option chain service modules, request/response schemas",
+      "outputs": "API router, Pydantic schemas, endpoint handlers, API documentation",
+      "files_to_create": [
+        "options-chain-service/src/api/__init__.py",
+        "options-chain-service/src/api/routes/__init__.py",
+        "options-chain-service/src/api/routes/option_chains.py",
+        "options-chain-service/src/api/routes/greeks.py",
+        "options-chain-service/src/api/routes/iv_metrics.py",
+        "options-chain-service/src/api/routes/strategies.py",
+        "options-chain-service/src/api/routes/pnl.py",
+        "options-chain-service/src/api/schemas.py",
+        "options-chain-service/tests/integration/test_api_endpoints.py"
+      ],
+      "files_to_modify": [
+        "options-chain-service/main.py (register routers)"
+      ]
+      "interfaces": [
+        "GET /api/v1/option-chains/{symbol}?expiry=YYYY-MM-DD -> OptionChainResponse",
+        "GET /api/v1/option-chains/{symbol}/{strike}/{option_type}?expiry=YYYY-MM-DD -> OptionContractResponse",
+        "GET /api/v1/greeks/{symbol}/{strike}/{option_type}?expiry=YYYY-MM-DD -> GreeksResponse",
+        "POST /api/v1/greeks/batch -> List[GreeksResponse]",
+        "GET /api/v1/iv-metrics/{symbol}/{strike}/{option_type}?expiry=YYYY-MM-DD -> IVMetricsResponse",
+        "POST /api/v1/strategies/validate -> ValidationResponse",
+        "POST /api/v1/strategies/calculate-greeks -> AggregatedGreeksResponse",
+        "POST /api/v1/strategies/payoff -> PayoffDiagramResponse",
+        "POST /api/v1/pnl/position -> PositionPnLResponse",
+        "POST /api/v1/pnl/strategy -> StrategyPnLResponse",
+        "POST /api/v1/pnl/scenario-analysis -> List[ScenarioPnLResponse]"
+      ],
+      "constraints": [
+        "All endpoints require Bearer token authentication (use smarttrade-common decorator)",
+        "Rate limiting: 100 req/min per user for data endpoints, 10 req/min for batch endpoints",
+        "Request validation: symbol must be alphanumeric, strike must be positive float, option_type must be 'CE' or 'PE'",
+        "Response schemas: use Pydantic with precise types, include timestamps",
+        "Error handling: return standardized SmartTradeError responses with error codes",
+        "Batch endpoints: max 50 items per request",
+        "Cache responses with appropriate TTL: 30s for live data, 5m for IV metrics"
+      ],
+      "acceptance_criteria": [
+        "GET option chain returns all strikes for symbol/expiry in < 200ms",
+        "Option contract endpoint returns complete data including greeks when available",
+        "Greeks endpoint returns computed greeks for any valid strike",
+        "Batch greeks endpoint processes 50 requests in < 1s",
+        "Validation endpoint rejects invalid strategies with descriptive error messages",
+        "Strategy calculation returns combined greeks and payoff curve",
+        "P&L endpoints return correct values for sample positions",
+        "All endpoints properly authenticated and rate-limited",
+        "API documentation auto-generated and accessible at /docs"
+      ]
+    },
+    {
+      "step": 8,
+      "title": "Implement WebSocket Server for Real-Time Option Chain Updates",
+      "description": "Build WebSocket endpoint in OCS to broadcast live option chain updates, Greeks changes, and P&L updates to connected frontend clients. Implement connection management, subscription handling, and message routing.",
+      "inputs": "WebSocket library (starlette websockets), Redis pub/sub, message schemas",
+      "outputs": "WebSocket handler, subscription manager, message broadcaster",
+      "files_to_create": [
+        "options-chain-service/src/websocket/__init__.py",
+        "options-chain-service/src/websocket/manager.py",
+        "options-chain-service/src/websocket/handlers.py",
+        "options-chain-service/src/websocket/broadcaster.py",
+        "options-chain-service/src/api/routes/websocket.py",
+        "options-chain-service/tests/integration/test_websocket.py"
+      ],
+      "files_to_modify": [
+        "options-chain-service/main.py (register WebSocket endpoint)"
+      ]
+      "interfaces": [
+        "WebSocketManager.connect(websocket: WebSocket, user_id: str) -> None",
+        "WebSocketManager.disconnect(user_id: str) -> None",
+        "WebSocketManager.subscribe(user_id: str, subscription: SubscriptionType) -> None",
+        "WebSocketManager.unsubscribe(user_id: str, subscription: SubscriptionType) -> None",
+        "Broadcaster.broadcast_option_update(symbol: str, expiry: str, strike: float, data: OptionUpdateMessage) -> None",
+        "Broadcaster.broadcast_greeks_update(symbol: str, expiry: str, strike: float, greeks: GreeksUpdateMessage) -> None",
+        "Broadcaster.broadcast_strategy_pnl_update(strategy_id: str, pnl_data: StrategyPnLMessage) -> None"
+      ],
+      "constraints": [
+        "Subscription types: 'option_chain:{symbol}:{expiry}', 'greeks:{symbol}:{expiry}', 'pnl:{strategy_id}', 'iv_metrics:{symbol}:{expiry}'",
+        "Message format: JSON with type, timestamp, data fields",
+        "Max connections per user: 3 (limit to avoid resource exhaustion)",
+        "Max subscriptions per connection: 20",
+        "Broadcast frequency: option prices every 1s, Greeks/IV every 5s, P&L every 1s",
+        "Use Redis pub/sub for multi-instance broadcasting (if scaled horizontally)",
+        "Connection timeout: 60s of inactivity",
+        "Graceful disconnect: send 'goodbye' message, log disconnection"
+      ],
+      "acceptance_criteria": [
+        "Client can connect and authenticate via token in query params or header",
+        "Client receives confirmation message after successful connection",
+        "Client can subscribe to multiple option chains simultaneously",
+        "Broadcast updates received within 1s of data change",
+        "Client can unsubscribe without disconnecting",
+        "Graceful disconnection with proper cleanup",
+        "Server handles client disconnect without crashing",
+        "Redis pub/sub allows multiple OCS instances to broadcast together",
+        "Integration test: connect, subscribe, receive 10+ updates, disconnect",
+        "Load test: handle 100 concurrent connections with subscriptions"
+      ]
+    },
+    {
+      "step": 9,
+      "title": "Implement Background Jobs for Option Data Refresh & Expiry Management",
+      "description": "Create async background jobs to periodically refresh option chain data from Fyers, update Greeks/IV metrics, handle option expiry transitions, and clean up stale data.",
+      "inputs": "APScheduler or Celery, cron schedules, data refresh intervals",
+      "outputs": "Job definitions, scheduler configuration, job handlers",
+      "files_to_create": [
+        "options-chain-service/src/tasks/__init__.py",
+        "options-chain-service/src/tasks/refresh_option_chains.py",
+        "options-chain-service/src/tasks/update_greeks.py",
+        "options-chain-service/src/tasks/update_iv_history.py",
+        "options-chain-service/src/tasks/handle_expiry.py",
+        "options-chain-service/src/tasks/cleanup_stale_data.py",
+        "options-chain-service/src/scheduler.py",
+        "options-chain-service/tests/integration/test_background_jobs.py"
+      ],
+      "files_to_modify": [
+        "options-chain-service/src/lifespan.py (initialize scheduler on startup)"
+      ]
+      "interfaces": [
+        "RefreshOptionChainJob.run(symbol: str, expiry: str) -> JobResult",
+        "UpdateGreeksJob.run(symbol: str, expiry: str) -> JobResult",
+        "UpdateIVHistoryJob.run() -> JobResult",
+        "HandleExpiryJob.run(symbol: str, expiry: str) -> JobResult",
+        "CleanupStaleDataJob.run(days_old: int = 90) -> JobResult"
+      ],
+      "constraints": [
+        "Refresh option chains: every 30s during market hours (9:15 - 15:30 IST), every 2h during off-hours",
+        "Update Greeks: every 5m during market hours (triggered by IV update or spot price > 0.5% change)",
+        "Update IV history: every 30m during market hours, store once per 30m interval",
+        "Handle expiry: 1h after market close, move expired options to archive, archive strategy templates",
+        "Cleanup stale data: daily at 23:00 IST, delete option history older than 18 months",
+        "Job execution must be idempotent (safe to run multiple times)",
+        "Failed job: log error, retry after 5m, alert if 3 consecutive failures",
+        "Job timeout: 5m (kill job if still running)"
+      ],
+      "acceptance_criteria": [
+        "Refresh job fetches and updates all active symbol/expiry combinations",
+        "Greeks updated in cache within 5m of IV change",
+        "IV history entry created every 30m with correct timestamp and values",
+        "Expired options marked as inactive and removed from live chain responses",
+        "Stale data cleanup deletes only data older than threshold",
+        "Jobs complete without errors during market hours",
+        "Job failures properly logged and don't block service",
+        "Integration test: run refresh job, verify DB updated correctly",
+        "Integration test: run expiry job, verify expired options archived"
+      ]
+    },
+    {
+      "step": 10,
+      "title": "Create Frontend Zustand Store for Option Chain State",
+      "description": "Implement Zustand store to manage option chain data, Greeks, IV metrics, and strategy state in frontend. Include selectors, actions for fetching/updating data, and WebSocket subscription management.",
+      "inputs": "Zustand patterns, option chain data models, WebSocket client library",
+      "outputs": "Zustand store file, hooks for consuming store, action dispatchers",
+      "files_to_create": [
+        "smarttrade-frontend/src/store/optionChainStore.ts",
+        "smarttrade-frontend/src/hooks/useOptionChain.ts",
+        "smarttrade-frontend/src/hooks/useOptionGreeks.ts",
+        "smarttrade-frontend/src/hooks/useOptionStrategy.ts",
+        "smarttrade-frontend/src/websocket/optionChainClient.ts",
+        "smarttrade-frontend/src/types/options.ts"
+      ],
+      "files_to_modify": [
+        "smarttrade-frontend/src/store/index.ts (export new store)"
+      ]
+      "interfaces": [
+        "OptionChainStore: { chains, greeks, ivMetrics, selectedChain, selectedStrategy, isLoading, error }",
+        "useOptionChain(): { chains, selectedChain, selectChain, refreshChain, isLoading }",
+        "useOptionGreeks(symbol: string, expiry: string): { greeks, isLoading, error }",
+        "useOptionStrategy(): { strategies, selectedStrategy, addLeg, removeLeg, calculateGreeks, calculatePayoff }",
+        "OptionChainWebSocketClient.subscribe(symbol: string, expiry: string, onUpdate: Callback): void",
+        "OptionChainWebSocketClient.unsubscribe(symbol: string, expiry: string): void"
+      ],
+      "constraints": [
+        "Store architecture: nested state by symbol > expiry > strike",
+        "Cache option chains in store for 30s (TTL), refetch on manual trigger or TTL expiry",
+        "Greeks cached in separate slice, updated on WebSocket messages",
+        "Strategy builder state: array of legs with strike_offset, option_type, quantity, side",
+        "WebSocket subscriptions tracked to avoid duplicate connections",
+        "Actions: fetchChain, updateChain, setSelectedChain, addStrategy, removeStrategy, calculateStrategyGreeks",
+        "Error state: capture and surface fetch/calculation errors to UI"
+      ],
+      "acceptance_criteria": [
+        "Store initialization works without errors",
+        "fetchChain action updates state with full option chain data",
+        "Strategy leg management (add/remove) works correctly",
+        "WebSocket subscription triggered when chain selected",
+        "Real-time updates from WebSocket merged into store state",
+        "Selectors return correct filtered data (e.g., ITM calls, strikes > X)",
+        "Multiple components can consume same store data without conflicts",
+        "Memory usage reasonable with 3+ open option chains"
+      ]
+    },
+    {
+      "step": 11,
+      "title": "Build Option Chain Table Component with Greeks Visualization",
+      "description": "Create React component displaying option chain as table with columns for strike, LTP, bid/ask, OI, IV, and Greeks (delta, gamma, theta, vega). Include filtering, sorting, color-coding for Greeks, and expand-on-click for strategy building.",
+      "inputs": "React patterns, Tailwind CSS, option chain data from store",
+      "outputs": "OptionChainTable component, Greeks cell component, filtering UI",
+      "files_to_create": [
+        "smarttrade-frontend/src/components/OptionChain/OptionChainTable.tsx",
+        "smarttrade-frontend/src/components/OptionChain/GreeksCell.tsx",
+        "smarttrade-frontend/src/components/OptionChain/ChainFilters.tsx",
+        "smarttrade-frontend/src/components/OptionChain/OptionChainTable.module.css",
+        "smarttrade-frontend/src/components/OptionChain/OptionChainTable.test.tsx"
+      ],
+      "files_to_modify": []
+      "interfaces": [
+        "OptionChainTable: React.FC<{ symbol: string; expiry: string; onSelectStrike: (strike: number) => void }>",
+        "GreeksCell: React.FC<{ greek: 'delta' | 'gamma' | 'theta' | 'vega'; value: number; optionType: 'CE' | 'PE' }>",
+        "ChainFilters: React.FC<{ onFilter: (filters: FilterState) => void }>"
+      ],
+      "constraints": [
+        "Table columns (in order): Strike, Call LTP, Call Bid/Ask, Call OI/Volume, Call IV, Call Delta, Call Gamma, Call Theta, Call Vega, Put LTP, Put Bid/Ask, Put OI/Volume, Put IV, Put Delta, Put Gamma, Put Theta, Put Vega",
+        "Row height: 32px, virtualized scrolling for 100+ strikes",
+        "Greeks color-coding: delta (red-green gradient), theta (red for positive/seller advantage), vega (blue gradient)",
+        "Sorting: click column header to sort by that column",
+        "Filtering: IV range, OI range, Greeks range, moneyness (ITM/ATM/OTM)",
+        "Responsive: horizontal scroll on mobile, collapse some columns on small screens",
+        "Auto-refresh: highlight newly updated cells for 2s after WebSocket update"
+      ],
+      "acceptance_criteria": [
+        "Table renders 50+ strikes without lag",
+        "Sorting by strike, IV, Greeks works correctly",
+        "Filtering reduces strike count as expected",
+        "Greeks values color-coded correctly",
+        "Click row to select strike (fires onSelectStrike callback)",
+        "WebSocket updates reflected in table in < 500ms",
+        "Table responsive on mobile (horizontal scroll works)",
+        "Component test: render with sample data, verify structure and sorting"
+      ]
+    },
+    {
+      "step": 12,
+      "title": "Build Option Strategy Builder UI Component",
+      "description": "Create interactive UI for building and analyzing option strategies. Include leg configuration (strike_offset, option_type, quantity, buy/sell), strategy template library, combined Greeks display, and payoff diagram.",
+      "inputs": "React patterns, payoff curve library (use lightweight-charts), strategy calculation engine",
+      "outputs": "StrategyBuilder component, strategy templates, payoff visualization",
+      "files_to_create": [
+        "smarttrade-frontend/src/components/OptionStrategy/StrategyBuilder.tsx",
+        "smarttrade-frontend/src/components/OptionStrategy/LegInput.tsx",
+        "smarttrade-frontend/src/components/OptionStrategy/StrategyTemplates.tsx",
+        "smarttrade-frontend/src/components/OptionStrategy/PayoffDiagram.tsx",
+        "smarttrade-frontend/src/components/OptionStrategy/StrategyGreeksSummary.tsx",
+        "smarttrade-frontend/src/components/OptionStrategy/StrategyBuilder.module.css",
+        "smarttrade-frontend/src/components/OptionStrategy/StrategyBuilder.test.tsx"
+      ],
+      "files_to_modify": []
+      "interfaces": [
+        "StrategyBuilder: React.FC<{ symbol: string; expiry: string; onSaveStrategy?: (strategy: StrategyDef) => void }>",
+        "LegInput: React.FC<{ leg: StrategyLeg; onUpdate: (leg: StrategyLeg) => void; onRemove: () => void; availableStrikes: number[] }>",
+        "StrategyTemplates: React.FC<{ onSelectTemplate: (template: string) => void }>",
+        "PayoffDiagram: React.FC<{ payoffData: Array<[number, number]>; currentSpot: number; maxProfit: number; maxLoss: number }>",
+        "StrategyGreeksSummary: React.FC<{ greeks: AggregatedGreeks; strategy: StrategyDef }>"
+      ],
+      "constraints": [
+        "Leg inputs: strike_offset (relative to current spot or absolute), option_type, quantity (1-100), side (buy/sell)",
+        "Predefined templates: Long Call, Long Put, Bull Call Spread, Bear Put Spread, Straddle, Strangle, Iron Condor, Call Ratio Spread",
+        "Combined Greeks display: total delta, gamma, theta, vega, max profit, max loss, risk/reward ratio",
+        "Payoff diagram: curve from spot -20% to spot +20%, show entry level, max profit/loss lines",
+        "Update payoff real-time as legs are added/modified",
+        "Validation: prevent invalid strategies, show error messages",
+        "Save strategy: capture strategy definition for later retrieval/execution"
+      ],
+      "acceptance_criteria": [
+        "Can build 2+ leg strategy and calculate combined Greeks",
+        "Payoff diagram updates instantly when leg parameters change",
+        "Template selection populates legs correctly",
+        "Greeks summary shows reasonable values (e.g., long call has positive delta)",
+        "Strategy validation catches invalid configs",
+        "Responsive on tablet and desktop",
+        "Component test: build bull call spread, verify Greeks and payoff"
+      ]
+    },
+    {
+      "step": 13,
+      "title": "Build Option P&L Visualization & Scenario Analysis Panel",
+      "description": "Create frontend component showing real-time P&L for option positions and strategies, including Greeks attribution (delta/gamma/theta/vega P&L), scenario analysis, and P&L over time chart.",
+      "inputs": "P&L calculation engine results, chart library (lightweight-charts), position data from store",
+      "outputs": "P&L panel component, scenario analysis modal, Greeks attribution breakdown",
+      "files_to_create": [
+        "smarttrade-frontend/src/components/OptionPnL/OptionPositionPnL.tsx",
+        "smarttrade-frontend/src/components/OptionPnL/StrategyPnL.tsx",
+        "smarttrade-frontend/src/components/OptionPnL/GreeksAttribution.tsx",
+        "smarttrade-frontend/src/components/OptionPnL/ScenarioAnalysis.tsx",
+        "smarttrade-frontend/src/components/OptionPnL/PnLChart.tsx",
+        "smarttrade-frontend/src/components/OptionPnL/OptionPnL.module.css"
+      ],
+      "files_to_modify": []
+      "interfaces": [
+        "OptionPositionPnL: React.FC<{ position: OptionPosition; currentPrice: number }>",
+        "StrategyPnL: React.FC<{ strategy: StrategyDef; positions: OptionPosition[] }>",
+        "GreeksAttribution: React.FC<{ attribution: PnLAttribution }>",
+        "ScenarioAnalysis: React.FC<{ strategy: StrategyDef; onAnalyze: () => void }>",
+        "PnLChart: React.FC<{ historicalData: Array<{ timestamp: string; pl: number }> }>"
+      ],
+      "constraints": [
+        "P&L display: absolute P&L in rupees, percentage P&L, per-contract P&L",
+        "Greeks attribution: show P&L contribution from delta, gamma, theta, vega, rho",
+        "Pie/bar chart for attribution breakdown",
+        "Scenario analysis: inputs for spot price levels, IV levels, days passed; outputs estimated P&L at each scenario",
+        "Heatmap visualization for scenario matrix (spot vs IV vs P&L)",
+        "Real-time updates from WebSocket (P&L refreshes every 1s during market hours)",
+        "Color coding: green for profit, red for loss"
+      ],
+      "acceptance_criteria": [
+        "P&L calculated correctly for sample position",
+        "Greeks attribution sums approximately to total P&L",
+        "Scenario analysis modal opens and generates scenarios",
+        "Heatmap renders with 5x5 scenario matrix",
+        "Real-time P&L updates visible every 1s",
+        "Chart shows P&L over time for multi-day positions",
+        "Responsive on all screen sizes",
+        "Component test: render sample strategy, verify P&L and attribution"
+      ]
+    },
+    {
+      "step": 14,
+      "title": "Integrate Option Chain into Market Data Service (MDS) for Real-Time Streaming",
+      "description": "Extend MDS to subscribe to and aggregate underlying asset price updates from Fyers WebSocket, making them available to OCS for Greeks recalculation. Implement efficient update notification to OCS when underlying moves significantly (> 0.5%).",
+      "inputs": "Existing MDS WebSocket infrastructure, underlying price data from Fyers",
+      "outputs": "MDS extension, event notifications, integration points",
+      "files_to_create": [
+        "market-data-service/src/brokers/fyers_underlying_updates.py (new module in MDS)",
+        "market-data-service/src/events/underlying_price_update_event.py"
+      ],
+      "files_to_modify": [
+        "market-data-service/src/main.py (add underlying price subscription)",
+        "market-data-service/src/config.py (add thresholds for Greeks recalc trigger)",
+        "smarttrade-common/src/events.py (add UnderlyingPriceUpdate event type)"
+      ]
+      "interfaces": [
+        "MDS publishes: UnderlyingPriceUpdate event when spot price changes > 0.5%",
+        "OCS subscribes: receives UnderlyingPriceUpdate, triggers Greeks recalculation for affected options"
+      ],
+      "constraints": [
+        "MDS already subscribes to underlying prices via Fyers WebSocket",
+        "Publish event with: symbol, old_price, new_price, pct_change, timestamp",
+        "Only publish if pct_change > 0.5% to avoid noise",
+        "OCS consumes event and triggers Greeks update job asynchronously"
+      ],
+      "acceptance_criteria": [
+        "MDS publishes event when underlying moves > 0.5%",
+        "OCS receives event and updates Greeks cache within 2s",
+        "No false positives (events only published for real moves)",
+        "Integration test: simulate underlying price change in Fyers, verify event published"
+      ]
+    },
+    {
+      "step": 15,
+      "title": "Integrate Option P&L into Broker Adapter Service Portfolio (BAS)",
+      "description": "Extend BAS portfolio aggregation to include option positions and compute option P&L alongside equity positions. Update portfolio endpoints to include option P&L metrics.",
+      "inputs": "BAS portfolio models, option position data from OCS, P&L calculations",
+      "outputs": "BAS extension for option positions, portfolio endpoints update",
+      "files_to_create": [
+        "broker-adapter-service/src/models/option_position.py",
+        "broker-adapter-service/src/services/option_portfolio.py"
+      ],
+      "files_to_modify": [
+        "broker-adapter-service/src/models/portfolio.py (add option positions to portfolio)",
+        "broker-adapter-service/src/api/routes/portfolio.py (update endpoints to include option P&L)"
+      ]
+      "interfaces": [
+        "BAS GET /portfolio includes: equity positions, option positions, option_pnl, total_pnl, equity_pnl, option_pnl",
+        "BAS calls OCS API to fetch option position P&L: POST /pnl/position with symbol, strike, option_type, quantity"
+      ],
+      "constraints": [
+        "BAS must query OCS for option P&L on each portfolio fetch (cache for 10s to avoid overload)",
+        "Portfolio totals: sum equity P&L and option P&L",
+        "Handle case where OCS is unavailable gracefully (show cached P&L or N/A)"
+      ],
+      "acceptance_criteria": [
+        "BAS portfolio endpoint includes option positions",
+        "Option P&L calculated and returned in portfolio response",
+        "Total portfolio P&L = equity P&L + option P&L",
+        "Integration test: fetch portfolio with both equity and option positions"
+      ]
+    },
+    {
+      "step": 16,
+      "title": "Create Option Chain Panel Component & Integrate into Frontend Layout",
+      "description": "Build Option Chain panel component combining option chain table, strategy builder, and P&L visualization. Integrate into React Grid Layout so user can add/resize option chain panel alongside existing trading panels.",
+      "inputs": "React Grid Layout library, existing panel architecture, option chain components",
+      "outputs": "OptionChainPanel wrapper component, layout configuration, panel registry update",
+      "files_to_create": [
+        "smarttrade-frontend/src/components/Panels/OptionChainPanel.tsx",
+        "smarttrade-frontend/src/components/Panels/OptionChainPanelConfig.ts"
+      ],
+      "files_to_modify": [
+        "smarttrade-frontend/src/components/PanelRenderer.tsx (add OptionChainPanel to panel types)",
+        "smarttrade-frontend/src/store/panelStore.ts (add option chain panel config)"
+      ]
+      "interfaces": [
+        "OptionChainPanel: React.FC<{ symbol: string; panelId: string; onClose: () => void }>",
+        "Panel type: 'option-chain' with props: { symbol, expiry, defaultHeight, defaultWidth }"
+      ],
+      "constraints": [
+        "Panel includes tabs: Chains, Strategy Builder, P&L",
+        "Default size: 600px x 800px (width x height)",
+        "Resizable and draggable via React Grid Layout",
+        "Data persists in localStorage for user session"
+      ],
+      "acceptance_criteria": [
+        "Option chain panel renders without errors",
+        "User can add panel from sidebar menu",
+        "Panel is resizable and draggable",
+        "Switching between tabs doesn't lose state",
+        "Panel closes properly and can be re-opened"
+      ]
+    },
+    {
+      "step": 17,
+      "title": "Write Integration Tests for Option Chain API & WebSocket",
+      "description": "Create comprehensive integration tests for OCS API endpoints, WebSocket connections, and data flows. Test option chain data fetch, Greeks calculation, IV metrics, strategy validation, P&L calculation, and real-time updates.",
+      "inputs": "pytest fixtures, sample option data, test scenarios",
+      "outputs": "Integration test suite, test data fixtures",
+      "files_to_create": [
+        "options-chain-service/tests/integration/test_option_chain_api.py",
+        "options-chain-service/tests/integration/test_greeks_api.py",
+        "options-chain-service/tests/integration/test_strategy_api.py",
+        "options-chain-service/tests/integration/test_pnl_api.py",
+        "options-chain-service/tests/integration/test_websocket_integration.py",
+        "options-chain-service/tests/fixtures.py"
+      ],
+      "files_to_modify": []
+      "interfaces": [
+        "Test classes: TestOptionChainAPI, TestGreeksAPI, TestStrategyAPI, TestPnLAPI, TestWebSocketIntegration",
+        "Fixtures: sample_option_chain, sample_strategy, sample_position, mock_fyers_data"
+      ],
+      "constraints": [
+        "Use pytest async fixtures for async tests",
+        "Use in-memory SQLite or test PostgreSQL database",
+        "Mock Fyers API calls where appropriate",
+        "Each test should be independent and idempotent",
+        "Cover happy path, error cases, edge cases",
+        "Test data: NIFTY 50, BANKNIFTY 50, FINNIFTY 50 indices with realistic Greeks values",
+        "Performance: all tests must complete in < 60s total"
+      ],
+      "acceptance_criteria": [
+        "Test coverage >= 80% for core modules",
+        "All happy path tests pass (fetch chains, calculate greeks, build strategies, calc P&L)",
+        "Error cases handled: invalid symbol, bad expiry, divide by zero in Greeks",
+        "WebSocket: connect, subscribe, receive update, unsubscribe, disconnect tests pass",
+        "Integration test simulates end-to-end user flow",
+        "All tests pass in CI/CD environment"
+      ]
+    },
+    {
+      "step": 18,
+      "title": "Write Postman Tests & Document API in Postman Collection",
+      "description": "Create Postman collection and environment file for Option Chain API, including all endpoints, sample requests/responses, test assertions, and documentation. Integrate into existing SmartTrade Postman collection.",
+      "inputs": "Existing Postman collection, API endpoints from step 7",
+      "outputs": "Postman collection file, environment file, API documentation",
+      "files_to_create": [
+        "SmartApp Integration Tests - Option Chain.postman_collection.json",
+        "SmartApp Option Chain Tests.postman_environment.json"
+      ],
+      "files_to_modify": [
+        "SmartApp Integration Tests.postman_collection.json (merge option chain collection)"
+      ]
+      "interfaces": [
+        "Postman requests for: GET chains, GET greeks, POST strategies, POST pnl, WebSocket subscription tests"
+      ],
+      "constraints": [
+        "Each request includes pre-request scripts to set up test data (symbol, expiry, strikes)",
+        "Each request includes test assertions (status code, response schema validation, value checks)",
+        "Environment variables: {{API_BASE_URL}}, {{SYMBOL}}, {{EXPIRY}}, {{STRIKE}}, {{AUTH_TOKEN}}",
+        "WebSocket test: open connection, send subscribe message, assert update message received"
+      ],
+      "acceptance_criteria": [
+        "All endpoint requests runnable and return expected responses",
+        "Test assertions pass for valid data",
+        "Error cases tested (invalid symbol, bad token, etc.)",
+        "Postman collection runnable in both CI and manual testing"
+      ]
+    },
+    {
+      "step": 19,
+      "title": "Add Docker & Docker Compose Configuration for Option Chain Service",
+      "description": "Create Dockerfile and update docker-compose files to include Options Chain Service alongside other SmartTrade services. Ensure service runs on port 8006 and proper startup/shutdown sequence.",
+      "inputs": "Existing Dockerfiles, service dependencies, environment variables",
+      "outputs": "Dockerfile, docker-compose entries, startup scripts",
+      "files_to_create": [
+        "options-chain-service/Dockerfile",
+        "options-chain-service/.dockerignore"
+      ],
+      "files_to_modify": [
+        "docker-compose.yml (add options-chain-service with port 8006)",
+        "docker-compose.local.yml (add options-chain-service)"
+      ]
+      "interfaces": [
+        "Service name: options-chain-service, Port: 8006, Database: smarttrade_options_chain_service"
+      ],
+      "constraints": [
+        "Base image: python:3.12-slim",
+        "Use uv for package installation in Docker (copy pyproject.toml, uv.lock)",
+        "Expose port 8006",
+        "Run uvicorn with --host 0.0.0.0 --port 8006 --reload (dev) or --workers 4 (prod)",
+        "Service startup depends on: postgres (DB ready), redis (event bus ready), authentication-service (for token validation)"
+      ],
+      "acceptance_criteria": [
+        "docker build creates image without errors",
+        "docker-compose up starts OCS alongside other services",
+        "Service reaches ready state (GET /ready returns 200) within 30s",
+        "Service accessible at http://localhost:8006",
+        "Docker logs show no errors during startup"
+      ]
+    },
+    {
+      "step": 20,
+      "title": "Create Comprehensive Documentation & Architecture Diagrams",
+      "description": "Write detailed documentation for Option Chain feature including architecture diagrams, API reference, database schema, algorithm explanations (Black-Scholes, Greeks calculation), user guide for UI, and deployment instructions.",
+      "inputs": "All previous implementations, architecture decisions",
+      "outputs": "Documentation files, diagrams, API reference",
+      "files_to_create": [
+        "options-chain-service/docs/ARCHITECTURE.md",
+        "options-chain-service/docs/API_REFERENCE.md",
+        "options-chain-service/docs/DEPLOYMENT.md",
+        "options-chain-service/docs/ALGORITHMS.md",
+        "smarttrade-frontend/docs/OPTION_CHAIN_UI_GUIDE.md",
+        "docs/OPTION_CHAIN_SYSTEM_DESIGN.md (root docs)"
+      ],
+      "files_to_modify": [
+        "README.md (add option chain section)"
+      ]
+      "interfaces": [
+        "Documentation should include: System overview, component interactions, API endpoints with examples, database schema, deployment steps, troubleshooting guide"
+      ],
+      "constraints": [
+        "Architecture diagrams: use ASCII art or Mermaid diagrams (for GitHub rendering)",
+        "API reference: OpenAPI/Swagger spec auto-generated from FastAPI code",
+        "Algorithm explanations: include formulas, worked examples, edge case handling",
+        "UI guide: screenshots, step-by-step workflows, keyboard shortcuts if any",
+        "Deployment: Docker setup, environment variables, database migrations, scaling notes"
+      ],
+      "acceptance_criteria": [
+        "Documentation covers all major components and workflows",
+        "API reference matches actual endpoints",
+        "Architecture diagrams are clear and accurate",
+        "Deployment guide allows new operator to set up OCS in < 30min",
+        "Algorithm explanations enable others to audit or modify calculations"
+      ]
+    },
+    {
+      "step": 21,
+      "title": "Performance & Load Testing for Option Chain Service",
+      "description": "Conduct load testing to ensure OCS can handle expected traffic: 100+ concurrent WebSocket connections, 1000 req/min for API calls, Greeks calculation for 500+ strikes within SLA. Document performance characteristics and optimization recommendations.",
+      "inputs": "Load testing tool (locust or Apache JMeter), performance benchmarks, production requirements",
+      "outputs": "Load test scripts, performance report, optimization recommendations",
+      "files_to_create": [
+        "options-chain-service/load_tests/locustfile.py",
+        "options-chain-service/load_tests/performance_report.md"
+      ],
+      "files_to_modify": []
+      "interfaces": [
+        "Load test: simulate 100 concurrent WebSocket users each subscribed to 5 option chains, generating 500 req/min API calls"
+      ],
+      "constraints": [
+        "Greeks calculation: < 50ms for single strike, < 500ms for batch of 100 strikes",
+        "Option chain fetch: < 200ms for 100+ strikes",
+        "API endpoint p99 latency: < 500ms under 1000 req/min load",
+        "WebSocket broadcast: < 1s latency from data update to client message received",
+        "Memory usage: < 500MB per 100 concurrent connections",
+        "CPU usage: < 80% with 4 workers under expected load"
+      ],
+      "acceptance_criteria": [
+        "Service handles 100 concurrent WebSocket connections without errors",
+        "1000 req/min API traffic processed without queue buildup",
+        "Greeks batch calculation for 100 strikes completes in < 500ms",
+        "P99 latency < 500ms for API calls, < 1s for WebSocket updates",
+        "No memory leaks detected over 1h sustained load test",
+        "Performance report documents bottlenecks and optimization recommendations"
+      ]
+    },
+    {
+      "step": 22,
+      "title": "Security & Compliance Review for Option Chain Service",
+      "description": "Conduct security audit covering API authentication/authorization, data validation, SQL injection prevention, XSS prevention, rate limiting, CORS, secret management, and compliance with SmartTrade security guidelines. Fix any findings before production deployment.",
+      "inputs": "OWASP Top 10, SmartTrade security guidelines, security checklist",
+      "outputs": "Security audit report, fixes for identified issues",
+      "files_to_create": [
+        "options-chain-service/SECURITY_AUDIT.md"
+      ],
+      "files_to_modify": [
+        "(as needed based on audit findings)"
+      ]
+      "interfaces": [
+        "Security audit covers: API auth (Bearer tokens), input validation, error handling, secret management, CORS config, rate limiting, dependency vulnerabilities"
+      ],
+      "constraints": [
+        "All endpoints must require Bearer token authentication",
+        "Input validation: symbol alphanumeric, strike positive float, option_type in ['CE', 'PE']",
+        "No SQL injection: use parameterized queries (SQLAlchemy ORM handles this)",
+        "No XSS: frontend sanitizes all user input before rendering",
+        "Rate limiting: 100 req/min per user for regular endpoints",
+        "CORS: allow only trusted frontend domain",
+        "Secrets: JWT_SECRET_KEY, FYERS_APP_SECRET stored in environment variables, never in code",
+        "Dependency vulnerabilities: run 'uv audit', fix any HIGH/CRITICAL findings"
+      ],
+      "acceptance_criteria": [
+        "Security audit identifies 0 CRITICAL or HIGH severity issues",
+        "All findings are documented and fixed before production",
+        "API authentication/authorization verified for all endpoints",
+        "Input validation prevents SQL injection and XSS",
+        "Rate limiting enforced and tested",
+        "Secrets properly managed (no hardcoded values)",
+        "CORS configuration restricts access to trusted origins"
+      ]
+    }
+  ],
+  "global_constraints": [
+    "Production-ready code only: no console.logs, no print() debug statements, no TODO comments",
+    "Follow clean architecture: separate concerns, dependency injection, testable code",
+    "Add comprehensive logging: use structlog (backend) and console.log with structured data (frontend)",
+    "Handle errors gracefully: return standardized SmartTradeError with error codes, log context",
+    "All async code: use AsyncIO backend and async/await patterns consistently",
+    "Type safety: strict typing in Python (use type hints), TypeScript strict mode in frontend",
+    "Database migrations: use Alembic for all schema changes, create migration for each step",
+    "Testing: min 80% code coverage, unit tests for algorithms, integration tests for APIs",
+    "Documentation: code comments for non-obvious logic, docstrings for functions, API docs auto-generated",
+    "Backwards compatibility: if changing existing schemas, include migration and deprecation period",
+    "Git commits: atomic, descriptive messages, one feature per commit",
+    "No hardcoded values: all configuration via environment variables or config files",
+    "Resilience: retry logic with exponential backoff, circuit breaker for external APIs, timeouts on all calls",
+    "Observability: log important events (startup, data refresh, API calls, errors), expose Prometheus metrics"
+  ]
+}
