@@ -1,22 +1,30 @@
 # SmartTrade Architecture v3.2 — Final Production-Ready
 
-**Status**: FINAL | Production-Ready | Execution-Focused | Broker-Centric
+**Status**: FINAL | Production-Ready | Execution-Focused | AI-Advisory | Broker-Centric
 **Date**: 2026-03-28
-**Version**: 3.3 (upgraded from 3.2)
-**Previous**: v3.2 Final
-**Upgrades**: Event bus durability, contract registry, execution fault-tolerance, rate limiting, multi-level kill switches, read models, versioning, audit API
+**Version**: 3.4 (upgraded from 3.3)
+**Previous**: v3.3 (9 reliability fixes)
+**Upgrades in v3.4**: AI Orchestrator (advisory-only), Notification Service (async alerts), Journal Service (trade + behavioral history), event-driven ecosystem integration
+**v3.3 Upgrades**: Event bus durability, contract registry, execution fault-tolerance, rate limiting, multi-level kill switches, read models, versioning, audit API
 **Target Completion**: 2026-07-01 (24 weeks, 5 phases)
 
 ---
 
 ## Executive Summary
 
-SmartTrade v3.2 is a **microservices-based, broker-agnostic trading platform** with:
+SmartTrade v3.4 is a **microservices-based, broker-agnostic trading platform** with:
 
 - **Core**: Centralized execution layer (Execution Orchestrator) ensuring atomic order handling, idempotency, and audit trails
 - **Intelligence**: Signal Engine (cross-market pattern detection) → Strategy Runtime (user-defined algos) → Execution
 - **Safety**: Actor model concurrency (per-user serialization), broker sync (drift detection), external trade handling, portfolio-level controls
-- **Support**: Market data (quotes, Greeks, options chains), risk engine (limits, daily loss), position management, settlement (T+1)
+- **Advisory** (NEW in v3.4): AI Orchestrator (LLM-powered insights, advisory only) + Notification Service (real-time alerts)
+- **Support**: Market data (quotes, Greeks, options chains), risk engine (limits, daily loss), position management, settlement (T+1), Journal Service (trade history + behavioral learning)
+
+**Key Differences from v3.3**:
+- Adds AI Orchestrator (advisory layer, strictly non-trading)
+- Adds Notification Service (async alert delivery)
+- Expands Journal Service (trade history + AI learning)
+- All new services are event-driven and non-blocking
 
 **Key Difference from v3.1**: Separates Portfolio Engine from Position Engine; adds explicit Strategy Runtime Engine; formalized Signal Engine with indicator + options + event signals.
 
@@ -110,18 +118,25 @@ SmartTrade v3.2 is a **microservices-based, broker-agnostic trading platform** w
     │ Durable, at-least-once event streaming              │
     │ Versioned events + idempotent handling               │
     ├────────────────┬──────────────────┬────────────────┤
-    │ order.placed.v1   │ position.changed.v1 │ market_data.quote.v1 │
-    │ order.filled.v1   │ portfolio.updated.v1 │ signal.triggered.v1 │
-    │ settlement.*.v1   │ risk.breach.v1      │ fill.matched.v1  │
-    │ (consumer groups) │ (replay capable)    │ (no duplicates)  │
+    │ order.*.v1        │ position.*.v1      │ market_data.*.v1 │
+    │ trade.*.v1        │ portfolio.*.v1     │ signal.*.v1      │
+    │ settlement.*.v1   │ risk.breach.v1     │ ai.*.v1          │
+    │ notification.*.v1 │ journal.*.v1       │ system.*.v1      │
     └────────────────┴──────────────────┴────────────────┘
        │
-       ▼
-    PostgreSQL (per-service databases)
-    ├─ auth_service_db
-    ├─ broker_adapter_service_db
-    ├─ market_data_service_db
-    └─ strategy_service_db (future)
+       ├──────────────────┬─────────────────┬──────────────────┐
+       │                  │                 │                  │
+       ▼                  ▼                 ▼                  ▼
+    ┌─────────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+    │ PostgreSQL      │ │ AI           │ │ Notification │ │ Journal      │
+    │ (per-service)   │ │ Orchestrator │ │ Service      │ │ Service      │
+    │                 │ │ (Port 8007)  │ │ (Port 8008)  │ │ (Port 8009)  │
+    │ • auth_db       │ │              │ │              │ │              │
+    │ • bas_db        │ │ • Insights   │ │ • Push       │ │ • Trades     │
+    │ • mds_db        │ │ • Scores     │ │ • Email      │ │ • Notes      │
+    │ • strategy_db   │ │ • Advisory   │ │ • WebSocket  │ │ • Analytics  │
+    └─────────────────┘ │ (non-trading)│ │ • DLQ retry  │ │ • Features   │
+                        └──────────────┘ └──────────────┘ └──────────────┘
 ```
 
 ### Event Bus Guarantees (FIX-01: Durability Upgrade)
@@ -163,10 +178,13 @@ await kafka_producer.send(
 
 | Service | Responsibility | Consumes | Produces |
 |---------|---|---|---|
-| **Auth** | User identity, JWT, RBAC | — | user.registered, user.logged_in |
-| **MDS** | Real-time quotes, Greeks, options | broker.session | market_data.quote, signal.* |
-| **BAS** | Orders, positions, risk, settlement | user requests + events | order.*, position.*, portfolio.* |
-| **Strategy** (future) | User-defined algos, backtesting | market_data.quote, signal.* | strategy.signal |
+| **Auth** | User identity, JWT, RBAC | — | user.registered.v1, user.logged_in.v1 |
+| **MDS** | Real-time quotes, Greeks, options | broker.session.v1 | market_data.quote.v1, signal.*.v1 |
+| **BAS** | Orders, positions, risk, settlement | user requests + events | order.*.v1, position.*.v1, portfolio.*.v1, trade.*.v1 |
+| **Strategy** (future) | User-defined algos, backtesting | market_data.quote.v1, signal.*.v1 | strategy.signal.v1 |
+| **AI Orchestrator** (NEW) | LLM insights, trade scoring, nudges | trade.*.v1, order.*.v1, strategy.*.v1 | ai.trade.score.v1, ai.nudge.v1, ai.warning.v1 |
+| **Notification Service** (NEW) | Alert delivery (push, email, WS) | ai.*.v1, risk.*.v1, order.*.v1 | notification.sent.v1, notification.failed.v1 |
+| **Journal Service** (NEW) | Trade history, behavioral analytics | trade.*.v1, ai.*.v1 | journal.entry.created.v1, journal.insight.generated.v1 |
 | **smarttrade-common** | Shared infrastructure | — | (used by all services) |
 
 ---
@@ -440,6 +458,410 @@ POST   /api/v1/backtest              — Run backtest
 GET    /api/v1/backtest/{id}         — Get backtest results
 
 WS     /ws/strategy/{id}             — Real-time strategy state
+```
+
+---
+
+### 3.5 AI Orchestrator Service (Port 8007 - NEW in v3.4, Phase 5)
+
+**Responsibility**: Generate AI-powered trade insights, scoring, and advisory recommendations. **ADVISORY ONLY — does not execute trades**.
+
+**Strict Constraint**: AI MUST NOT:
+- ❌ Call broker APIs
+- ❌ Manipulate execution layer
+- ❌ Bypass risk controls
+- ❌ Trigger trades directly
+- ✅ CAN: Generate scores, insights, warnings for UI display
+
+**Inputs** (consumes from event bus):
+- `order.placed.v1`, `order.filled.v1`, `order.cancelled.v1` — Order execution
+- `trade.filled.v1`, `trade.closed.v1` — Completed trades
+- `position.changed.v1` — Position updates
+- `strategy.signal.v1` — Strategy triggers
+- `risk.breach.v1` — Risk violations
+- `journal.entry.created.v1` — User trade annotations
+
+**Outputs** (publishes to event bus):
+- `ai.trade.score.v1` — Score (0-100) for historical trade
+- `ai.nudge.v1` — Gentle suggestion (e.g., "Consider tightening stop-loss")
+- `ai.recommendation.v1` — Strategy suggestion (e.g., "Similar pattern worked 75% of time")
+- `ai.warning.v1` — Risk alert (e.g., "Similar setup led to 10% drawdowns")
+
+**Components**:
+1. **Feature Extractor**: Convert trades → ML features (volatility, momentum, correlation, etc.)
+2. **Embeddings Store**: Store trade embeddings for similarity search
+3. **Pattern Matcher**: Find historical similar trades
+4. **LLM Interface**: Query Claude for insights
+5. **Scoring Engine**: Score trades on profitability, risk-adjusted returns, execution quality
+
+**API Routes** (Phase 5):
+```
+GET    /api/v1/ai/trade/{trade_id}/score       — Get trade score
+GET    /api/v1/ai/insights/{symbol}            — Get insights for symbol
+GET    /api/v1/ai/recommendations/{strategy}   — Get recommendations for strategy
+GET    /api/v1/ai/history                      — Get historical patterns
+
+WS     /ws/ai/insights                         — Real-time AI insights stream
+```
+
+**Example: Trade Scoring**:
+```python
+class AIOrchestrator:
+    async def score_trade(self, trade: Trade) -> TradeScore:
+        """Generate score for a closed trade"""
+        # Extract features from trade
+        features = await self.feature_extractor.extract(trade)
+
+        # Find similar trades in history
+        similar_trades = await self.embeddings_store.find_similar(
+            features,
+            limit=10
+        )
+
+        # Calculate metrics
+        win_rate = sum(1 for t in similar_trades if t.pnl > 0) / len(similar_trades)
+        avg_pnl = sum(t.pnl for t in similar_trades) / len(similar_trades)
+
+        # LLM insight (optional)
+        insight = await self.llm.query(f"""
+            Trade setup: {trade.setup}
+            Win rate: {win_rate}
+            Avg P&L: {avg_pnl}
+            Provide brief insight.
+        """)
+
+        return TradeScore(
+            trade_id=trade.id,
+            overall_score=calculate_score(win_rate, avg_pnl),
+            insight=insight,
+            similar_count=len(similar_trades),
+            timestamp=datetime.utcnow()
+        )
+```
+
+**Integration with Journal Service**:
+- AI Orchestrator scores trades
+- Scores and insights stored in Journal Service
+- Users can query insights, similar patterns
+
+**Non-Trading Guarantee**:
+- ✅ AI observes execution flow
+- ✅ AI suggests improvements
+- ✅ Frontend displays AI recommendations
+- ❌ AI never triggers execution
+- ❌ If AI wants to "trade", it publishes event that frontend ignores
+
+---
+
+### 3.6 Notification Service (Port 8008 - NEW in v3.4, Phase 5)
+
+**Responsibility**: Deliver alerts and notifications via multiple channels (WebSocket, push, email) asynchronously.
+
+**Constraint**: Must be non-blocking and never impact trading flow.
+
+**Inputs** (consumes from event bus):
+- `ai.nudge.v1`, `ai.warning.v1` — AI recommendations
+- `risk.breach.v1` — Risk violations
+- `order.*.v1` — Order state changes
+- `position.changed.v1` — Position updates
+- `system.error.v1`, `system.alert.v1` — System alerts
+
+**Outputs**:
+- `notification.sent.v1` — Successfully delivered
+- `notification.failed.v1` — Failed delivery (retry queued)
+
+**Channels**:
+1. **WebSocket** (real-time, for connected clients)
+   - Instant UI notifications
+   - Bell icon badge, toast alerts
+
+2. **Push Notifications** (mobile apps)
+   - Risk breaches, critical alerts
+   - Order fills, large position changes
+
+3. **Email** (persistent, for historical reference)
+   - Daily summary of trades
+   - Important alerts
+   - Weekly insights
+
+4. **SMS** (critical only, opt-in)
+   - Portfolio-level kill switch triggered
+   - Extreme risk breach
+
+**Configuration** (per user):
+```yaml
+notification_preferences:
+  channels:
+    websocket: true      # Always enabled for web app
+    push: true
+    email: true
+    sms: false
+
+  rules:
+    ai_nudge: "websocket+email"
+    risk_breach: "websocket+push+email"
+    order_fill: "websocket"
+    portfolio_alert: "websocket+push+sms"
+
+  frequency:
+    email_daily_summary: true
+    email_weekly_insights: true
+    max_notifications_per_hour: 100  # Prevent spam
+```
+
+**Implementation**:
+```python
+class NotificationService:
+    """Async notification delivery"""
+
+    async def on_risk_breach(self, event: RiskBreachEvent):
+        """Handle risk breach notification"""
+        # Queue to avoid blocking trading flow
+        await self.notification_queue.put({
+            "event_type": "risk_breach",
+            "user_id": event.user_id,
+            "severity": "critical",
+            "message": f"Daily loss limit reached: {event.loss}%"
+        })
+
+    async def deliver_notifications(self):
+        """Background worker: deliver queued notifications"""
+        while True:
+            notification = await self.notification_queue.get()
+            try:
+                # Get user preferences
+                prefs = await self.user_prefs.get(notification["user_id"])
+
+                # Deliver via configured channels
+                if prefs.websocket:
+                    await self.websocket_deliver(notification)
+                if prefs.push:
+                    await self.push_deliver(notification)
+                if prefs.email:
+                    await self.email_deliver(notification)
+
+                # Publish success event
+                await publish_event("notification.sent.v1", notification)
+            except Exception as e:
+                # Publish failure event
+                await publish_event("notification.failed.v1", {
+                    **notification,
+                    "error": str(e)
+                })
+                # Retry with exponential backoff
+                await self.retry_queue.put(notification)
+```
+
+**Monitoring**:
+- Track notification delivery success rate per channel
+- Alert if email delivery drops below 95%
+- Monitor queue depth (should be <100)
+
+---
+
+### 3.7 Journal Service (Port 8009 - EXPANDED in v3.4)
+
+**Responsibility**: Store complete trade history, user notes, and behavioral analytics for learning and compliance.
+
+**Inputs**:
+- `trade.filled.v1` — Completed trades
+- `trade.closed.v1` — Closed positions
+- `ai.trade.score.v1` — AI trade scores
+- `ai.recommendation.v1` — AI recommendations
+
+**Outputs**:
+- `journal.entry.created.v1` — Trade recorded
+- `journal.updated.v1` — User annotation added
+- `journal.insight.generated.v1` — Pattern analysis complete
+
+**Stored Data** (immutable core):
+```python
+class JournalEntry(BaseModel):
+    # Immutable trade execution
+    trade_id: str
+    order_id: str
+    symbol: str
+    side: Literal["BUY", "SELL"]
+    quantity: Decimal
+    entry_price: Decimal
+    exit_price: Decimal
+    pnl: Decimal
+    pnl_percent: Decimal
+    duration: timedelta
+
+    # Execution context
+    executed_at: datetime
+    closed_at: datetime
+    strategy_id: Optional[str]
+
+    # User annotations (mutable)
+    user_notes: str = ""
+    tags: List[str] = []
+
+    # AI analysis (read-only for user)
+    ai_score: Optional[float]
+    ai_insights: Optional[str]
+
+    # Analytics
+    execution_quality: Optional[float]  # 0-100
+    risk_adjusted_return: Optional[float]
+    historical_similarity: Optional[str]
+```
+
+**APIs**:
+```
+GET    /api/v1/journal/trades                     — List trades
+GET    /api/v1/journal/trades/{trade_id}          — Get trade detail
+PUT    /api/v1/journal/trades/{trade_id}/notes    — Add user notes (only field that's mutable)
+GET    /api/v1/journal/insights                   — Get analyzed patterns
+GET    /api/v1/journal/stats                      — Win rate, avg P&L, etc.
+
+POST   /api/v1/journal/trades/{trade_id}/tags     — Add tags ("good_setup", "rushed", etc.)
+GET    /api/v1/journal/tags                       — List all tags
+GET    /api/v1/journal/tags/{tag}                 — Find trades by tag
+
+WS     /ws/journal/new-insights                   — Real-time pattern updates
+```
+
+**Immutability Guarantee**:
+- ❌ User CANNOT edit trade execution data (price, quantity, date)
+- ❌ User CANNOT delete trades
+- ✅ User CAN add/edit personal notes
+- ✅ User CAN add tags for categorization
+- ✅ AI can generate insights
+
+**AI Learning Integration**:
+```python
+class JournalService:
+    async def generate_insights(self, user_id: str) -> Insights:
+        """Analyze user's trading history for patterns"""
+        trades = await self.get_closed_trades(user_id)
+
+        # Find patterns
+        profitable_setups = self.find_winning_patterns(trades)
+        losing_setups = self.find_losing_patterns(trades)
+
+        # Calculate statistics
+        stats = {
+            "win_rate": sum(1 for t in trades if t.pnl > 0) / len(trades),
+            "avg_win": sum(t.pnl for t in trades if t.pnl > 0) / len([t for t in trades if t.pnl > 0]),
+            "avg_loss": sum(t.pnl for t in trades if t.pnl < 0) / len([t for t in trades if t.pnl < 0]),
+            "profit_factor": total_wins / abs(total_losses)
+        }
+
+        # Store insights
+        await self.db.insights.create({
+            "user_id": user_id,
+            "profitable_setups": profitable_setups,
+            "losing_setups": losing_setups,
+            "stats": stats,
+            "generated_at": datetime.utcnow()
+        })
+
+        # Publish event
+        await publish_event("journal.insight.generated.v1", {
+            "user_id": user_id,
+            "insight_type": "pattern_analysis",
+            "findings": len(profitable_setups) + len(losing_setups)
+        })
+```
+
+**Compliance & Export**:
+```
+GET    /api/v1/journal/export?format=csv&start_date=...&end_date=...
+→ Export all trades for compliance/taxes
+```
+
+---
+
+### 3.8 Service Boundaries & Ecosystem Integration (NEW in v3.4)
+
+**Principle**: Trading execution (core) remains isolated from advisory, notifications, and analytics (periphery).
+
+#### Event Flow: From Execution to Insights
+
+```
+Core Trading Flow (synchronous)
+┌────────────────────────────────┐
+│ User places order              │
+│ → Execution Orchestrator       │
+│ → Risk Engine validation       │
+│ → Broker submission            │
+│ → order.placed event           │
+└────────────┬───────────────────┘
+             │
+             ▼ (asynchronous event subscriptions)
+┌────────────────────────────────────────────────────────────┐
+│ Advisory & Support Layer (non-blocking)                    │
+├────────────────────────────────────────────────────────────┤
+│                                                             │
+│  order.placed.v1 ──┐                                       │
+│                    ├──→ AI Orchestrator                     │
+│                    │     ├─→ Score trade                    │
+│  trade.filled.v1 ──┤     └─→ Find patterns                 │
+│                    │        ai.trade.score.v1              │
+│  strategy.signal ──┤        ai.recommendation.v1           │
+│                    │                                        │
+│                    ├──→ Notification Service               │
+│  ai.nudge.v1 ──────┤     ├─→ WebSocket delivery           │
+│  risk.breach.v1 ───┤     ├─→ Push notification            │
+│                    │     └─→ Email summary                │
+│                    │        notification.sent.v1          │
+│                    │                                       │
+│                    └──→ Journal Service                    │
+│                        ├─→ Record trade                    │
+│  ai.score.v1 ──────────┤    ├─→ Store execution data       │
+│  ai.recommendation ────┤    ├─→ AI insights               │
+│                        └─→ Provide learning dataset       │
+│                           journal.insight.generated.v1    │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Critical Guarantee**: Advisory layer CANNOT affect core trading flow.
+
+#### Service Isolation Rules
+
+| Layer | Services | Can Do | Cannot Do |
+|-------|----------|--------|-----------|
+| **Core** | Execution, Risk, Broker | Execute trades, validate risk, block orders | Call AI, modify notifications |
+| **Advisory** | AI Orchestrator | Score trades, find patterns, advise | Place orders, call broker, bypass risk |
+| **Support** | Notification, Journal | Deliver alerts, store history, learn | Affect trading flow, modify execution |
+
+#### Enforcement Mechanisms
+
+**1. Import Restrictions** (code-level):
+```python
+# ❌ AI Orchestrator CANNOT import these
+from broker_adapter_service.execution import ExecutionOrchestrator
+from broker_adapter_service.broker_adapter import BrokerAdapter
+from broker_adapter_service.risk_engine import RiskEngine
+
+# ✅ AI Orchestrator CAN import these
+from smarttrade_common.events import publish_event, subscribe_event
+from smarttrade_common.database import AsyncSession
+```
+
+**2. Event Bus Permissions** (infrastructure-level):
+```
+Kafka topic ACLs:
+├─ BAS can write to: order.*.v1, position.*.v1, trade.*.v1
+├─ AI can read from: order.*.v1, trade.*.v1, strategy.*.v1
+├─ AI can write to: ai.*.v1
+├─ Notification can read from: ai.*.v1, risk.*.v1, order.*.v1
+├─ Notification can write to: notification.*.v1
+└─ Journal can read from: trade.*.v1, ai.*.v1
+    Journal can write to: journal.*.v1
+```
+
+**3. API Routing** (gateway-level):
+```
+/api/v1/orders/place
+  → Only Execution Orchestrator can accept this
+  → AI cannot send requests to this endpoint
+
+/api/v1/ai/insights
+  → Only frontend can consume this
+  → This does NOT trigger trading
 ```
 
 ---
@@ -2265,13 +2687,15 @@ E2E Tests: 2+ services, real databases
 
 | Field | Value |
 |-------|-------|
-| **Title** | SmartTrade Architecture v3.3 — Production-Ready + Reliability |
-| **Version** | 3.3 (upgraded 2026-03-28) |
+| **Title** | SmartTrade Architecture v3.4 — Production-Ready + Advisory Ecosystem |
+| **Version** | 3.4 (upgraded 2026-03-28) |
 | **Date** | 2026-03-28 |
 | **Author** | Claude Code (AI) |
 | **Status** | APPROVED FOR IMPLEMENTATION |
-| **Upgrades from v3.2** | Event bus durability, contract registry, execution fault-tolerance, rate limiting, multi-level kill switches, read models, versioning, audit API |
-| **Next Review** | After Phase 2 completion |
+| **Upgrades in v3.4** | AI Orchestrator (advisory-only), Notification Service (async alerts), Journal Service (expanded), service boundary enforcement |
+| **Upgrades in v3.3** | Event bus durability, contract registry, execution fault-tolerance, rate limiting, multi-level kill switches, read models, versioning, audit API |
+| **Upgrades in v3.2** | Execution Orchestrator, idempotency, broker sync engine, portfolio separation |
+| **Next Review** | After Phase 4 completion (Strategy Engine + AI advisory) |
 | **Related Docs** | CLAUDE.md (master playbook), claude.json (execution plan) |
 
 ---
