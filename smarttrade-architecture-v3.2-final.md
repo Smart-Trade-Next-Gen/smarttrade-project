@@ -18,7 +18,7 @@ SmartTrade v3.4 is a **microservices-based, broker-agnostic trading platform** w
 - **Intelligence**: Signal Engine (cross-market pattern detection) → Strategy Runtime (user-defined algos) → Execution
 - **Safety**: Actor model concurrency (per-user serialization), broker sync (drift detection), external trade handling, portfolio-level controls
 - **Advisory** (NEW in v3.4): AI Orchestrator (LLM-powered insights, advisory only) + Notification Service (real-time alerts)
-- **Support**: Market data (quotes, Greeks, options chains), risk engine (limits, daily loss), position management, settlement (T+1), Journal Service (trade history + behavioral learning)
+- **Support**: Market data (real-time quotes, instrument resolution), risk engine (limits, daily loss), position management, execution tracking, Journal Service (trade history + behavioral learning)
 
 **Key Differences from v3.3**:
 - Adds AI Orchestrator (advisory layer, strictly non-trading)
@@ -29,7 +29,9 @@ SmartTrade v3.4 is a **microservices-based, broker-agnostic trading platform** w
 **Key Difference from v3.1**: Separates Portfolio Engine from Position Engine; adds explicit Strategy Runtime Engine; formalized Signal Engine with indicator + options + event signals.
 
 **Implementation Status**:
-- ✅ **Core**: Auth, BAS (orders, risk, PIE, settlement), MDS (quotes, Greeks), Mock Service — 250+ tests
+- ✅ **Core**: Auth, BAS (orders, risk, PIE), MDS (quotes, instrument resolution), Mock Service — 250+ tests
+- ⚠️ **MDS Deferred**: Greeks Calculator, IV Metrics, Option Chain Service (Phase 2 post-launch)
+- ⚠️ **BAS Architectural Debt**: Quote cache, instrument cache, portfolio mixed with positions, action logging (Phase 1 cleanup)
 - ❌ **Missing**: Order State Machine, Idempotency, Execution Orchestrator, Broker Sync, Strategy Engine, Signal Engine
 - 🔄 **In Progress**: Frontend (Phase 5, 80% done)
 
@@ -47,9 +49,11 @@ SmartTrade v3.4 is a **microservices-based, broker-agnostic trading platform** w
 | Position Tracking | ✅ | Complete; P&L calculation done |
 | Risk Engine | ✅ | YAML-driven; daily loss, position limits |
 | PIE (Position Intelligence) | ✅ | Auto-entry, kill-switch, rule triggering |
-| Market Data | ✅ | Quotes, Greeks, options chains |
-| Settlement | ✅ | T+1 lifecycle, dividend processing |
+| Market Data | ✅ | Quotes, instrument resolution, trading calendar |
 | Authentication | ✅ | JWT, RBAC, bcrypt |
+| **Quote Cache (BAS)** | ⚠️ | In-memory local cache; should consume from MDS events |
+| **Instrument Cache (BAS)** | ⚠️ | Local metadata cache; duplicates MDS responsibility |
+| **Action Logging (BAS)** | ⚠️ | Stores PIE logs in BAS DB; should be event-driven (Journal Service) |
 | **Execution Orchestrator** | ❌ | No centralized queue |
 | **Idempotency** | ❌ | Not integrated into endpoints |
 | **Order State Machine** | ❌ | No formal states |
@@ -80,6 +84,43 @@ SmartTrade v3.4 is a **microservices-based, broker-agnostic trading platform** w
 
 ---
 
+## 1.5 Architectural Debt & Phase 1 Cleanup Items
+
+**Scope**: Issues in current implementation that must be cleaned up before full production rollout.
+
+### Phase 1 Cleanup (Before Go-Live)
+
+| Issue | Location | Impact | Fix Effort | Priority |
+|-------|----------|--------|-----------|----------|
+| **Quote Cache Duplication** | `broker_adapter_service/quote_store.py` | Violates MDS ownership; creates stale price risk | 4 hrs | **HIGH** |
+| **Instrument Cache Duplication** | `broker_adapter_service/instrument_cache.py` | Duplicates MDS; metadata divergence risk | 6 hrs | **HIGH** |
+| **Action Logging Sync** | `broker_adapter_service/action_log_service.py` | Stores logs in BAS DB; should be event-driven | 8 hrs | **MEDIUM** |
+| **Portfolio Mixed with Position** | `broker_adapter_service/portfolio_service.py` | Violates single responsibility; blocks portfolio-level rules | Refactor Phase 2-3 | **MEDIUM** |
+
+**Total Phase 1 Cleanup Effort**: ~18 hours (reduce by moving quote/instrument cache to consumption model)
+
+**Recommended Approach**:
+```
+BEFORE: BAS maintains local cache of quotes & instruments
+  quote_store.py (local in-memory)
+  instrument_cache.py (local with TTL refresh)
+
+AFTER: BAS consumes from event stream
+  - Subscribe to market_data.quote events from MDS
+  - Instrument metadata from MDS API (with fallback 1-hour local cache)
+  - No refresh loops; event-driven updates
+```
+
+### Phase 2-3 Refactoring (Blocking Future Features)
+
+| Issue | Component | Target Phase | Impact | Details |
+|-------|-----------|--------------|--------|---------|
+| **Portfolio Engine Separation** | `portfolio_service.py` (currently in BAS) | Phase 2-3 | Blocks portfolio-level risk rules, Greeks aggregation | Currently mixed with PositionEngine; needs clear boundary |
+| **Action Log Event Model** | `action_log_service.py` (currently sync writes) | Phase 2-3 | Blocks Journal Service integration | Switch from direct DB writes to event publishing |
+| **PIE/Strategy Boundary** | PIE + Strategy (~1,042 lines) | Phase 4 Pre-Work | Blocks Strategy Engine launch | Extract PIE to separate policy engine; clarify defensive vs. offensive logic |
+
+---
+
 ## 2. Architecture Overview (v3.2)
 
 ### High-Level System Design
@@ -104,10 +145,10 @@ SmartTrade v3.4 is a **microservices-based, broker-agnostic trading platform** w
 │ (8001)   │  │ (8004)      │  │ Service      │  │ (future) │
 │          │  │             │  │ (8005)       │  │          │
 │ • JWT    │  │ • Quotes    │  │ • Orders     │  │ • Signal │
-│ • RBAC   │  │ • Greeks    │  │ • Risk       │  │ • Eval   │
-│ • Users  │  │ • Options   │  │ • Positions  │  │ • State  │
-└──────┬───┘  │ • Calendar  │  │ • Settlement │  └──────┬───┘
-       │      │ • Margin    │  │ • PIE        │         │
+│ • RBAC   │  │ • Instruments│  │ • Risk       │  │ • Eval   │
+│ • Users  │  │ • Calendar  │  │ • Positions  │  │ • State  │
+└──────┬───┘  │ • Trading   │  │ • Execution  │  └──────┬───┘
+       │      │   Times     │  │ • PIE        │         │
        │      └──────┬──────┘  │ • Adapter    │         │
        │             │         └────────┬─────┘         │
        │             │                  │               │
@@ -120,7 +161,7 @@ SmartTrade v3.4 is a **microservices-based, broker-agnostic trading platform** w
     ├────────────────┬──────────────────┬────────────────┤
     │ order.*.v1        │ position.*.v1      │ market_data.*.v1 │
     │ trade.*.v1        │ portfolio.*.v1     │ signal.*.v1      │
-    │ settlement.*.v1   │ risk.breach.v1     │ ai.*.v1          │
+    │ execution.*.v1    │ risk.breach.v1     │ ai.*.v1          │
     │ notification.*.v1 │ journal.*.v1       │ system.*.v1      │
     └────────────────┴──────────────────┴────────────────┘
        │
@@ -179,8 +220,8 @@ await kafka_producer.send(
 | Service | Responsibility | Consumes | Produces |
 |---------|---|---|---|
 | **Auth** | User identity, JWT, RBAC | — | user.registered.v1, user.logged_in.v1 |
-| **MDS** | Real-time quotes, Greeks, options | broker.session.v1 | market_data.quote.v1, signal.*.v1 |
-| **BAS** | Orders, positions, risk, settlement | user requests + events | order.*.v1, position.*.v1, portfolio.*.v1, trade.*.v1 |
+| **MDS** | Real-time quotes, instrument resolution, trading calendar | broker.session.v1 | market_data.quote.v1 |
+| **BAS** | Orders, positions, risk, execution | user requests + events | order.*.v1, position.*.v1, portfolio.*.v1, trade.*.v1 |
 | **Strategy** (future) | User-defined algos, backtesting | market_data.quote.v1, signal.*.v1 | strategy.signal.v1 |
 | **AI Orchestrator** (NEW) | LLM insights, trade scoring, nudges | trade.*.v1, order.*.v1, strategy.*.v1 | ai.trade.score.v1, ai.nudge.v1, ai.warning.v1 |
 | **Notification Service** (NEW) | Alert delivery (push, email, WS) | ai.*.v1, risk.*.v1, order.*.v1 | notification.sent.v1, notification.failed.v1 |
@@ -308,7 +349,7 @@ class UserRegisteredV1(BaseEvent):
 
 ### 3.2 Broker Adapter Service (Port 8005)
 
-**Responsibility**: Order execution, position management, risk validation, settlement, PIE controls, broker integration.
+**Responsibility**: Order execution, position management, risk validation, execution tracking, PIE controls, broker integration.
 
 **Core Layers** (bottom-up):
 
@@ -334,13 +375,16 @@ class UserRegisteredV1(BaseEvent):
 - **Features**: YAML-driven rules, real-time breach detection
 - **Integration**: Blocks risky orders; triggers alerts
 
-#### Layer 5: Portfolio Engine (NEW in v3.2)
-- **Responsibility** (NEW): Separated from Position Engine
+#### Layer 5: Portfolio Engine (Phase 2-3 Refactor)
+- **Current State**: ⚠️ **MIXED WITH POSITION ENGINE** (portfolio_service.py lives in BAS, not separated)
+- **Target Responsibility** (Phase 2-3): Separate from Position Engine
   - Total MTM (mark-to-market) tracking
   - Global stop-loss (portfolio-level)
   - Capital allocation across strategies
   - Exposure management (sector, instrument type)
+  - Portfolio-level Greeks (when Phase 2 Greeks available)
 - **Output**: Portfolio summary API, events on state change
+- **Refactor Note**: Extract PortfolioService from BAS into separate logical layer; currently conflated with position tracking
 
 #### Layer 6: Execution Layer
 - **Execution Orchestrator** (Phase 2): Centralized order queue (asyncio actor model)
@@ -349,17 +393,20 @@ class UserRegisteredV1(BaseEvent):
 - **Audit Logger**: Immutable log of all operations
 - **Retry & Resilience**: Exponential backoff, circuit breaker for broker calls
 
-#### Layer 7: PIE (Position Intelligence Engine) (Current)
-- **Responsibility**: Auto-entry, kill-switch, rule triggering
-- **Components**: `AutoEntryService`, `KillSwitchService`, `ActionOrchestrator`
+#### Layer 7: PIE (Position Intelligence Engine) (Phase 4 Refactor Needed)
+- **Current Responsibility**: Auto-entry, kill-switch, rule triggering (defensive position controls)
+- **Components**: `AutoEntryService`, `KillSwitchService`, `ActionOrchestrator` (~1,042 lines in BAS)
 - **Integration**: Consumes market data → evaluates rules → triggers actions
+- **⚠️ ARCHITECTURAL DEBT**:
+  - PIE currently tightly coupled in BAS (1,042 lines of business logic)
+  - Overlaps with Phase 4 Strategy Engine (both do DSL evaluation, trigger detection, state tracking)
+  - Action logging should be event-driven (publishes `action.executed.v1` → Journal Service) not stored in BAS DB
+  - **Phase 4 Pre-Work**: Extract PIE to separate boundary (pie-service or refactor to pure Policy Engine)
+    - Keep: Position-based rules (kill-switch on loss, take-profit)
+    - Defer to Strategy: User-defined algo entry/exit
+    - Move: Action logs to event-driven model
 
-#### Layer 8: Settlement Service
-- **Responsibility**: T+1 settlement lifecycle
-- **Phases**: Execution → Confirmation → Settlement
-- **Handling**: Dividend processing, corporate actions
-
-#### Layer 9: Broker Sync Engine (Phase 3 - NEW)
+#### Layer 8: Broker Sync Engine (Phase 3 - NEW)
 - **Responsibility**: Reconciliation, external trade capture, drift detection
 - **Features**:
   - Polling + WebSocket hybrid model
@@ -398,33 +445,39 @@ WS     /api/v1/positions/ws         — Position updates
 
 ### 3.3 Market Data Service (Port 8004)
 
-**Responsibility**: Real-time quotes, instrument resolution, options chains, Greeks calculation, IV metrics.
+**Responsibility**: Real-time quotes, instrument resolution, trading calendar.
 
-**Components**:
-1. **Instrument Service**: Lookup, resolution, broker mapping
-2. **Quote Service**: Real-time quote streaming, WebSocket fan-out
-3. **Option Chain Service**: Chain retrieval, caching, refresh scheduling
-4. **Greeks Calculator**: Black-Scholes calculation (single + multi-leg)
-5. **IV Metrics Service**: Implied volatility, volatility surface
-6. **Trading Calendar**: Market holidays, session times
+**Implemented Components**:
+1. **Instrument Service** ✅ — Lookup, resolution, broker mapping
+2. **Quote Service** ✅ — Real-time quote streaming, WebSocket fan-out
+3. **Trading Calendar** ✅ — Market holidays, session times
+4. **Event Publishing Layer** ✅ — DomainEventPublisher integration
 
-**Routes**:
+**Deferred Components** (Phase 2 Post-Launch):
+- Greeks Calculator — Black-Scholes calculation (single + multi-leg)
+- IV Metrics Service — Implied volatility, volatility surface
+- Option Chain Service — Chain retrieval, caching, refresh scheduling
+
+**Routes Implemented**:
 ```
 GET    /api/v1/instruments           — Lookup instruments
 GET    /api/v1/instruments/{symbol}  — Get instrument detail
-GET    /api/v1/data/quote            — Get quote snapshot
-GET    /api/v1/greeks                — Get Greeks for option
-GET    /api/v1/options/{symbol}      — Get option chain
-GET    /api/v1/iv_metrics/{symbol}   — Get IV surface
+GET    /api/v1/data/history/{broker_id}/{instrument_id}  — Historical candles
+GET    /api/v1/data/quotes/{broker_id}  — Get quote snapshot
 
 WS     /ws                           — Real-time quote stream
-WS     /ws/greeks                    — Real-time Greeks updates
+```
+
+**Routes Not Yet Implemented**:
+```
+GET    /api/v1/greeks                — Get Greeks for option (Phase 2)
+GET    /api/v1/options/{symbol}      — Get option chain (Phase 2)
+GET    /api/v1/iv_metrics/{symbol}   — Get IV surface (Phase 2)
+WS     /ws/greeks                    — Real-time Greeks updates (Phase 2)
 ```
 
 **Events Published**:
-- `market_data.quote` (real-time price)
-- `market_data.option_chain` (chain updated)
-- `market_data.greeks` (Greeks calculated)
+- `market_data.quote` ✅ (real-time price)
 
 ---
 
@@ -1334,12 +1387,12 @@ async def reconcile_symbol(symbol: str):
 
 ```
 Market Data
-  (quotes, Greeks, options chains)
+  (quotes) [Greeks + options chains deferred to Phase 2]
         │
         ▼
 Signal Engine (Phase 5)
   ├─ Indicators (RSI, MACD, MA, VWAP, Bollinger Bands)
-  ├─ Options (IV rank, PCR, OI trends)
+  ├─ Options (IV rank, PCR, OI trends) [Phase 2 - requires Greeks/IV]
   └─ Events (expiry, opening range, news)
         │
         ▼ (signal.triggered events)
@@ -1813,7 +1866,9 @@ Body: {"level": "portfolio"}
 
 ---
 
-## 9. Option Chain & Multi-Asset Support
+## 9. Option Chain & Multi-Asset Support (PHASE 2 - DEFERRED)
+
+**Note**: The Option Chain Service and Greeks Calculator are deferred to Phase 2 (post-launch). Current Phase 1 focuses on equity quotes only. This section documents the target design.
 
 ### Instrument Abstraction
 
@@ -2201,12 +2256,138 @@ async def resolve_conflict(self, orders: List[Order]) -> Order:
 | Service | Owns | Does NOT Own | Publishes | Consumes |
 |---------|------|--------------|-----------|----------|
 | **Auth** | Users, JWT, RBAC | — | user.* events | — |
-| **BAS** | Orders, Positions, Risk, PIE | Market data, Auth | order.*, position.* | market_data.quote, user requests |
-| **MDS** | Instruments, Quotes, Greeks | Orders, Positions | market_data.*, signal.* | broker.session |
+| **BAS** | Orders, Positions, Risk, PIE | Market data ✅, Audit logs ⚠️, Metadata ⚠️ | order.*, position.* | market_data.quote, user requests |
+| **MDS** | Instruments, Quotes, Calendar | Orders, Positions, Greeks (Phase 2), Execution | market_data.quote | broker.session |
+| **Journal Service** (future) | Trade history, Audit logs ⚠️ | Execution, Position mgmt | journal.entry.created.v1 | trade.*.v1, action.executed.v1 |
 | **Strategy** (future) | Strategies, Backtest | Execution, Positions | strategy.signal | market_data.quote, signal.* |
 | **smarttrade-common** | Auth, DB, Events, Errors | Business logic | — | (used by all) |
 
 **Principle**: Minimize cross-service coupling; use events for async communication.
+
+**Architectural Debt Notes**:
+- ⚠️ **BAS Metadata**: Currently maintains local instrument_cache.py (TTL-based). Should subscribe to MDS events or use MDS API only.
+- ⚠️ **BAS Quote Cache**: Currently maintains local quote_store.py (in-memory). Should consume from market_data.quote events only.
+- ⚠️ **BAS Audit Logs**: Currently stores action_log directly in BAS DB (sync writes). Phase 2-3: Switch to event model → Journal Service (action.executed.v1 → journal.entry.created.v1)
+
+---
+
+## 11.5 Architectural Cleanup Roadmap
+
+### Phase 1 (Go-Live Cleanup) — 18 hours
+
+**Goal**: Remove cache duplication, stabilize boundaries before production.
+
+#### Task 1.1: Remove Quote Cache from BAS (4 hours)
+```
+REMOVE: quote_store.py
+  - Delete in-memory quote cache
+  - Remove quote update from WebSocket feed
+
+CHANGE: Risk calculations & position tracking
+  - Instead of reading from quote_store.get()
+  - Subscribe to market_data.quote events from MDS
+  - Store latest quote in memory during event processing
+  - Fallback: API call to MDS if quote not in recent event stream
+```
+
+#### Task 1.2: Remove Instrument Cache Refresh Logic (6 hours)
+```
+REMOVE: instrument_cache.py refresh loop
+  - Delete periodic refresh from MDS
+  - Keep local cache as LRU (1-hour TTL)
+
+CHANGE: Instrument lookups
+  - On miss: Call MDS /api/v1/instruments/{symbol} (cached 1 hour locally)
+  - Alternative (Phase 2): Subscribe to instrument.updated.v1 events
+
+BENEFIT: No dual sources of truth; MDS is authoritative
+```
+
+#### Task 1.3: Start Publishing PIE Action Events (8 hours)
+```
+ADD: action.executed.v1 event publishing
+  - When: Kill-switch triggers, auto-entry executes, rule fires
+  - Payload: user_id, action_type, rule_id, position_symbol, effect (qty_change, pnl_impact)
+  - Publishes to: EventBus (Kafka/Redis topic: action.executed.v1)
+
+KEEP FOR NOW: action_log table in BAS (for UI queries)
+  - Also store locally for 24-hour UI history
+  - Phase 2-3: Migrate to read from Journal Service events
+
+NOTE: Don't delete ActionLogService yet; just add event publishing alongside
+```
+
+---
+
+### Phase 2-3 (Portfolio & Action Log Refactor) — 40+ hours
+
+**Goal**: Separate portfolio engine, event-driven action logging, clear PIE boundaries.
+
+#### Task 2.1: Extract Portfolio Engine (20 hours)
+```
+REFACTOR: portfolio_service.py from BAS
+  - Current: Lives in broker_adapter_service/services/
+  - Target: Separate component/package
+
+NEW BOUNDARIES:
+  - PositionEngine: Per-instrument tracking (FIFO, MTM, P&L/symbol)
+  - PortfolioEngine: Aggregate metrics (total MTM, exposure, allocation %)
+  - Interface: Portfolio consumes position events (position.changed.v1)
+```
+
+#### Task 2.2: Migrate Action Logging to Event-Driven (15 hours)
+```
+REFACTOR: action_log_service.py
+  - Current: Sync writes to BAS DB
+  - Target: Event publishing → Journal Service consumption
+
+FLOW:
+  PIE triggers action
+    → publish action.executed.v1 event
+    → Journal Service consumes
+    → stores in journal_db
+    → BAS queries Journal Service for audit history (or reads events)
+
+BENEFIT: Audit logs are immutable, centralized, event-sourced
+```
+
+#### Task 2.3: Define PIE Boundaries Clearly (5+ hours)
+```
+CLARIFY: What PIE does vs. what Strategy does
+
+PIE (Defensive Policy Engine):
+  - Kill-switch: Close on loss threshold
+  - Take-profit: Auto-exit at price
+  - Position limits: Block entry if at max positions
+  - Daily loss cap: Pause trading if breached
+
+DEFER to Strategy Engine (Phase 4):
+  - Entry signals (RSI, MACD, patterns)
+  - Exit optimization
+  - User-defined DSL
+  - Backtesting
+
+DOCUMENT: Clear separation; no overlap
+```
+
+---
+
+### Phase 4 (Pre-Strategy Launch) — TBD
+
+**Goal**: PIE and Strategy coexist without conflicts.
+
+#### Task 4.1: Prepare PIE for Strategy Coexistence
+```
+EXTRACT: PIE from BAS into separate logical module/service
+  - Option A: pie-service (separate deployment)
+  - Option B: PIE as pure policy engine in smarttrade-common
+
+ENSURE: No duplicate execution logic between PIE and Strategy
+  - PIE applies after Strategy (safety layer)
+  - Clear precedence: Risk rules > Strategy rules
+
+NOTE: Detailed design depends on Strategy requirements
+```
 
 ---
 
@@ -2668,7 +2849,7 @@ E2E Tests: 2+ services, real databases
 | Term | Definition |
 |------|-----------|
 | **BAS** | Broker Adapter Service (core execution) |
-| **MDS** | Market Data Service (quotes, Greeks) |
+| **MDS** | Market Data Service (real-time quotes, instrument resolution) |
 | **PIE** | Position Intelligence Engine (auto-entry, kill-switch) |
 | **Execution Orchestrator** | Centralized order queue (asyncio) |
 | **Strategy Runtime** | Execution of user-defined strategies |
