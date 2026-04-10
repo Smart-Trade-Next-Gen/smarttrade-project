@@ -4,123 +4,202 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SmartTrade is a **microservices-based trading platform** providing a normalized, broker-agnostic interface for executing trades, managing market data, and authentication. The primary broker integration is Fyers, with architecture supporting others (Zerodha, Interactive Brokers).
+**smarttrade-project** is the centralized repository for SmartTrade design documents, architecture guides, and cross-service planning. It is a separate git repo from the main monorepo (`smarttrade-mono`), ensuring design decisions are versioned and discoverable independently.
 
-## Services & Ports
+## Purpose
 
-| Service | Port | Database |
-|---|---|---|
-| Authentication Service | 8001 | `smarttrade_authentication_service` |
-| Mock Service | 8002 | `smarttrade_mock_service` |
-| Market Data Service (MDS) | 8004 | `smarttrade_market_data_service` |
-| Broker Adapter Service (BAS) | 8005 | `smarttrade_broker_adapter_service` |
-| Frontend | 5173 | — |
+This repo holds:
+- **Architecture documents** — System-wide design (v3.4 current)
+- **Cross-service design documents** — Features spanning 2+ services (in `design/cross-service/`)
+- **Planning & roadmaps** — Phased rollout strategies
 
-All backend services are FastAPI + Python 3.12, using `uv` as the package manager. PostgreSQL is used in production, SQLite for local dev. Redis is the event bus.
+Service-specific documentation lives in each service's own repository (see README for links).
+
+## Directory Structure
+
+```
+smarttrade-project/
+  design/
+    cross-service/      ← Multi-service feature designs only
+  smarttrade-architecture-v3.4-current.md  ← Current architecture doc
+  README.md             ← Quick links to all documents & service repos
+  ROADMAP.md            ← Feature roadmap and timeline
+  CLAUDE.md             ← This file
+```
+
+Service-specific documentation is maintained in each service repository:
+- `broker-adapter-service/docs/` — BAS implementation, LLDs, Fyers API reference
+- `market-data-service/docs/` — MDS implementation
+- `mock-service/docs/` — Paper Broker Service implementation
+- `authentication-service/docs/` — Auth service documentation
+- `smarttrade-tests/docs/` — E2E testing strategy
+- `smarttrade-deployment/` — Infrastructure and deployment configuration
+
+## Design Document Workflow
+
+SmartTrade uses a **Streaming Design Model** where design and implementation happen in separate phases:
+
+### Phase 1: Design (in smarttrade-project)
+
+1. Create a new design doc in `design/cross-service/` following the naming convention:
+   ```
+   YYYY-MM-DD-<feature-name>-v1.md
+   Example: 2026-03-28-pie-feature-v1.md
+   ```
+
+2. Structure the doc with these sections:
+   - **Executive Summary** — What, why, which services, success criteria
+   - **Architecture Diagram** — Service flows, events, APIs
+   - **Service-Specific Sections** — One per affected service (what to implement)
+   - **Detailed Specifications** — Event schemas, API contracts, data models, error codes
+   - **Dependencies & Sequencing** — What blocks what, implementation order
+   - **Testing Strategy** — Unit, integration, E2E test coverage
+
+3. Commit the design doc:
+   ```bash
+   git add design/cross-service/YYYY-MM-DD-feature-v1.md
+   git commit -m "Design: <feature-name> (v1)"
+   ```
+
+4. Create symlinks in affected service directories:
+   ```bash
+   # In smarttrade-mono/broker-adapter-service/design/
+   ln -s ../../smarttrade-project/design/cross-service/YYYY-MM-DD-feature-v1.md FEATURE_NAME
+   git add FEATURE_NAME
+   git commit -m "Design: Add FEATURE_NAME reference"
+   ```
+
+### Phase 2: Implementation (in individual service repos)
+
+Implementations happen in the main monorepo (`smarttrade-mono`), with each service reading its design doc via symlink.
+
+### Phase 3: Design Iteration
+
+If implementation reveals gaps, create a new design version:
+
+```bash
+1. Update design doc in smarttrade-project/
+2. Save as: YYYY-MM-DD-feature-v2.md
+3. Commit: git add && git commit
+4. Update symlinks in service repos (optional)
+5. Continue implementation with v2
+
+# Full version history is preserved in git
+```
+
+## Key Rules
+
+### Design Doc Placement (MANDATORY)
+
+**In smarttrade-project**:
+- ✓ Cross-service designs → `design/cross-service/` (features spanning 2+ services)
+- ✓ Architecture documents → Repository root (e.g., `smarttrade-architecture-v3.4-current.md`)
+
+**In Service Repositories** (NOT in smarttrade-project):
+- ✓ Service-specific implementation docs → Service's own `docs/` directory
+- ✓ LLDs, API specs, design decisions → Service's own `docs/` directory
+- ✓ Broker API references (e.g., Fyers) → Service's own `docs/` directory
+- ✓ Test strategies (E2E) → `smarttrade-tests/docs/`
+
+**What NOT to do**:
+- ✗ Never place service-specific designs in `smarttrade-project/design/<service-name>/`
+- ✗ Never duplicate docs across repos (single source of truth = service's own docs/)
+- ✗ Never put implementation docs in smarttrade-project (they belong in service repos)
+
+### API and Data Contracts
+
+Design docs **must** include:
+- REST endpoint specs (method, path, request/response schemas)
+- WebSocket message schemas (if applicable)
+- Event schemas (Pydantic models with field descriptions)
+- Error codes with descriptions
+- Database schema changes (if applicable)
+
+Use concrete examples, not abstract descriptions.
+
+### Financial Code
+
+If the design touches trading, positions, or settlement:
+- Reference the Financial Correctness guide (`docs/FINANCIAL_CORRECTNESS.md`)
+- Include validation rules (e.g., position limits, daily loss caps)
+- Document audit trail requirements
+- Specify rounding rules and precision (e.g., decimal places for prices)
+
+### Naming Conventions
+
+- **Feature names**: lowercase with hyphens (e.g., `pie-feature`, `portfolio-sync`)
+- **Services**: match the main repo (`broker-adapter-service`, `market-data-service`, etc.)
+- **Error codes**: 3-letter prefix + number (e.g., `ORD_001`, `MDS_002`)
 
 ## Commands
 
-### Python Services (run inside each service directory)
+### Design Docs
 
 ```bash
-uv sync                        # Install dependencies
-uv sync --extra dev            # Include dev dependencies
-uv run uvicorn <module>.main:app --reload  # Run service
+# Create new design doc
+vi design/cross-service/YYYY-MM-DD-<feature>-v1.md
 
-uv run pytest                  # Run all tests
-uv run pytest tests/path/to/test.py::test_name  # Run single test
-uv run pytest -m unit          # Run only unit tests
-uv run pytest --cov            # With coverage
+# Verify doc compiles and links are valid
+# (Use VS Code to check markdown rendering)
 
-uv run ruff check src/         # Lint
-uv run mypy src/               # Type check
+# Commit design doc
+git add design/cross-service/...
+git commit -m "Design: <feature-name> (v1)"
 
-uv run alembic upgrade head    # Apply DB migrations
-uv run alembic revision -m "description"  # Create migration
+# Create symlink in service directory
+cd <monorepo>/broker-adapter-service/design/
+ln -s ../../smarttrade-project/design/cross-service/YYYY-MM-DD-feature-v1.md FEATURE
+git add FEATURE && git commit -m "Design: Add FEATURE reference"
 ```
 
-pytest is configured with `asyncio_mode = auto` and `--maxfail=1` by default.
+### Service Documentation
 
-### Frontend (`smarttrade-frontend/`)
+All service-specific documentation is maintained in the service's own repository:
 
-```bash
-npm install
-npm run dev      # Vite dev server with HMR
-npm run build    # Production build
-npm run lint     # ESLint on .ts/.tsx files
-```
+- **Broker Adapter Service**: See `broker-adapter-service/docs/`
+  - Includes: Order State Machine, Execution Orchestrator, Outbox Pattern, Idempotency, Risk Engine
+  - Includes: Fyers API reference (complete API documentation)
+- **Market Data Service**: See `market-data-service/docs/`
+- **Paper Broker Service**: See `mock-service/docs/`
+- **E2E Testing**: See `smarttrade-tests/docs/E2E_TESTING_STRATEGY.md`
 
-### Docker (all services together)
+These docs are the source of truth for implementation. Do not reference old/archived documentation.
 
-```bash
-docker-compose up                              # Start everything
-docker-compose -f docker-compose.local.yml up  # Alternative local config
-docker-compose logs -f <service-name>          # Follow logs
-```
+## Testing Strategy
 
-## Architecture
+- **Unit tests** → Service repo (same service)
+- **Integration tests** → Service repo (same service)
+- **E2E tests** → `smarttrade-tests/` repo (cross-service workflows)
+- **E2E testing strategy & patterns** → `smarttrade-tests/docs/E2E_TESTING_STRATEGY.md`
 
-### `smarttrade-common` — Shared Library
+Never put E2E tests in individual service repos or smarttrade-project.
 
-All services depend on this local package. It provides:
-- `app_factory.py` — Creates FastAPI app with standard middleware, CORS, exception handlers, Bearer auth
-- `lifespan.py` — Startup/shutdown hooks (DB init, event bus connection)
-- `config.py` — `CommonSettings` base class (Pydantic Settings); each service extends it
-- `auth.py` / `security/` — JWT (HS256) generation/validation, RBAC, bcrypt password hashing
-- `database/` — Async SQLAlchemy session management, generic repository pattern, Alembic support
-- `events/` — Redis/Kafka event bus, publish/subscribe, Pydantic event schemas
-- `middleware/` — Rate limiting, request ID tracking, auth enforcement
-- `resilience/` — Retry with exponential backoff, circuit breaker, timeouts
-- `rule_engine/` — Config-driven validation rules (used by risk engine in BAS)
-- `errors.py` — `SmartTradeError` base exception with standardized error codes (e.g., `VAL_001`, `AUTH_004`)
-- `http_client/` — Service-to-service HTTP with retry/timeout/circuit breaker
-- `observability/` — Prometheus metrics, OpenTelemetry tracing
-- `health.py` — Liveness (`GET /`) and readiness (`GET /ready`) probes
+## Collaboration
 
-### Service Responsibilities
+When working on a design:
 
-**Authentication Service** — User registration/login, JWT access + refresh token lifecycle, bcrypt password hashing, RBAC role assignment, audit logging.
+1. **Draft locally** — Create the doc in your branch
+2. **Solicit feedback** — Share the doc URL with team before committing
+3. **Commit when ready** — Design doc is finalized
+4. **Implement in parallel** — Services can start implementation once design is committed
+5. **Iterate if needed** — Create v2 if clarifications emerge during implementation
 
-**Broker Adapter Service (BAS)** — Translates SmartTrade order models ↔ Fyers API calls, risk validation via rule engine, position/fund aggregation, session management for broker connections, publishes domain events (order.placed, order.filled, etc.).
+## FAQ
 
-**Market Data Service (MDS)** — Subscribes to Fyers WebSocket data streams, fans out market data to connected clients, instrument resolution & broker mapping, trading calendar management.
+**Q: Where do service-specific docs go?**
+A: In the service's own repository (e.g., `broker-adapter-service/docs/`). Not in smarttrade-project. This keeps docs close to code.
 
-**Mock Service** — Mirrors BAS API for testing without real broker connections; simulates fills and price movements.
+**Q: Where do cross-service designs go?**
+A: In `smarttrade-project/design/cross-service/`. Use naming: `YYYY-MM-DD-feature-name-v1.md`.
 
-**Frontend** — React 18 + TypeScript, Vite, Tailwind CSS. State via Zustand, charts via `lightweight-charts`, dashboard layout via `react-grid-layout`. Connects to backend via axios and WebSocket.
+**Q: When should I create a new version (v2) of a design?**
+A: If implementation reveals gaps or changes, create v2. Git preserves the full evolution.
 
-### Key Patterns
+**Q: Who approves designs?**
+A: No approval gate. Commit when confident. Fast feedback beats slow approval.
 
-- **Database-per-service**: Each service owns its own PostgreSQL database; no cross-service DB queries.
-- **Event-driven**: Services communicate asynchronously via Redis (or Kafka) using Pydantic-typed domain events.
-- **Async-first**: All services use AsyncIO + asyncpg; all DB queries and HTTP calls are async.
-- **RBAC**: Roles enforced via JWT claims and decorators from `smarttrade-common`.
-- **Config**: All settings via environment variables; `CommonSettings` base class using Pydantic Settings.
+**Q: Can services reference docs in smarttrade-project?**
+A: Yes, cross-service designs (via git submodule symlinks if needed). But service-specific docs must live in the service repo.
 
-### Service Start Order
-
-PostgreSQL → Redis → Auth Service → MDS → BAS → Mock Service → Frontend
-
-### Environment Variables (key ones)
-
-```
-ENV=local|dev|staging|prod
-DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/db
-JWT_SECRET_KEY=<base64>
-TOKEN_ENCRYPTION_KEY=<base64>
-EVENT_BUS=redis
-EVENT_BUS_URL=redis://redis:6379/0
-FYERS_APP_ID=...
-FYERS_APP_SECRET=...
-BROKER_REDIRECT_URI=http://www.smarttrade.asia/
-SENTRY_ENABLED=true|false
-PROMETHEUS_ENABLED=true
-VITE_API_BASE=...          # Frontend: backend API URL
-VITE_WAS_BASE=...          # Frontend: WebSocket aggregator URL
-```
-
-## Testing
-
-Integration tests are in Postman (`SmartApp Integration Tests.postman_collection.json` + `Smartapp Local.postman_environment.json` at the repo root).
-
-Each service has its own `tests/` directory with unit and integration tests. pytest markers: `unit`, `slow`.
+**Q: I found outdated docs in an archive/. Should I use them?**
+A: No. Always use current docs in the service's active `docs/` directory. Archives are historical reference only.

@@ -6,61 +6,63 @@ Design documents, architecture references, guides, and project planning for the 
 
 | Document | Description |
 |----------|-------------|
-| [Architecture](docs/ARCHITECTURE.md) | Production-grade system architecture |
-| [Roadmap](docs/ROADMAP.md) | Feature roadmap Q1–Q4 2026 |
-| [API Overview](docs/API_OVERVIEW.md) | All REST + WebSocket APIs |
-| [Financial Correctness](docs/FINANCIAL_CORRECTNESS.md) | Non-negotiable rules for financial code |
+| **[Architecture v3.4 (Current)](smarttrade-architecture-v3.4-current.md)** | **← START HERE** Current production architecture (Phase 10 active) |
+| [ROADMAP.md](ROADMAP.md) | Feature roadmap Q1–Q4 2026 |
+| [CLAUDE.md](CLAUDE.md) | Global development guidance and architecture principles |
 
-## How-To Guides
+## Service-Specific Documentation
 
-| Guide | Description |
-|-------|-------------|
-| [Setup](docs/guides/SETUP.md) | Local development setup |
-| [Deploy](docs/guides/DEPLOY.md) | Production deployment |
-| [Add Broker](docs/guides/ADD_BROKER.md) | Integrate a new broker |
-| [Add Feature](docs/guides/ADD_FEATURE.md) | Implement a new feature |
-| [Testing](docs/guides/TESTING.md) | Testing patterns and best practices |
+**Note**: Service-specific design and implementation documentation is maintained in each service's own repository under `docs/`. The locations below are for reference only.
 
-## Service Design Documents
+### Core Services
+- **Broker Adapter Service (BAS)**: See [`broker-adapter-service/docs/INDEX.md`](../broker-adapter-service/docs/INDEX.md) for complete documentation
+  - Includes: Order State Machine, Execution Orchestrator, Idempotency, Outbox Pattern, Risk Engine, Fyers API reference
+- **Market Data Service (MDS)**: See [`market-data-service/docs/`](../market-data-service/docs/) for documentation
+- **Paper Broker Service** (formerly Mock Service): See [`mock-service/docs/`](../mock-service/docs/) for documentation
+- **Authentication Service**: See [`authentication-service/docs/`](../authentication-service/docs/) for documentation
 
-| Service | Document |
-|---------|----------|
-| Authentication | [design/authentication-service/DESIGN.md](design/authentication-service/DESIGN.md) |
-| Broker Adapter | [design/broker-adapter-service/Design.md](design/broker-adapter-service/Design.md) |
-| → Order Lifecycle | [design/broker-adapter-service/ORDER_LIFECYCLE_DESIGN.md](design/broker-adapter-service/ORDER_LIFECYCLE_DESIGN.md) |
-| → Risk Engine | [design/broker-adapter-service/RISK_ENGINE_DESIGN.md](design/broker-adapter-service/RISK_ENGINE_DESIGN.md) |
-| → PIE Engine | [design/broker-adapter-service/PIE_DESIGN.md](design/broker-adapter-service/PIE_DESIGN.md) |
-| → Settlement (T+1) | [design/broker-adapter-service/SETTLEMENT_DESIGN.md](design/broker-adapter-service/SETTLEMENT_DESIGN.md) |
-| → Position Management | [design/broker-adapter-service/POSITION_MANAGEMENT_DESIGN.md](design/broker-adapter-service/POSITION_MANAGEMENT_DESIGN.md) |
-| Market Data | [design/market-data-service/DESIGN.md](design/market-data-service/DESIGN.md) |
-| Frontend | [design/frontend/DESIGN.md](design/frontend/DESIGN.md) |
-| smarttrade-common | [design/smarttrade-common/DESIGN.md](design/smarttrade-common/DESIGN.md) |
+### Testing & Deployment
+- **E2E Testing Strategy**: See [`smarttrade-tests/docs/E2E_TESTING_STRATEGY.md`](../smarttrade-tests/docs/E2E_TESTING_STRATEGY.md)
+- **Deployment Configuration**: See [`smarttrade-deployment/`](../smarttrade-deployment/) for docker-compose and infrastructure as code
 
 ## Platform Overview
 
-SmartTrade is a broker-agnostic algorithmic trading platform:
+SmartTrade is a broker-agnostic algorithmic trading platform in production:
 
-- **5 microservices**: Auth, BAS (Broker Adapter), MDS (Market Data), Mock, Frontend
-- **Broker plugins**: Fyers (live), Paper (simulation), + extensible for others
-- **PIE Engine**: Position automation — auto-entry, kill switch, strategy execution
-- **Risk Engine**: Config-driven rules (daily loss, position limits, per-trade risk)
-- **Options**: Live chains, Black-Scholes Greeks, IV rank/percentile
-- **Settlement**: T+1 settlement cycle with immutable audit trail
-- **250+ tests** across all services
+- **Core Services**: Authentication, Broker Adapter (BAS), Market Data (MDS), Paper Broker Service (paper trading), Frontend
+- **Order Handling**: Order State Machine (Phase 4 ✅), Execution Orchestrator (Phase 8 ✅), Idempotency (Phase 3 ✅)
+- **Event Architecture**: Outbox Pattern (Phase 5 ✅), transactional event publishing via Redis Streams
+- **Broker Adapters**: Fyers (live trading) + Paper Broker Service (integration testing)
+- **Risk Management**: Position Intelligence Engine (PIE), Risk Engine with daily loss/position limits
+- **Test Coverage**: 250+ unit tests, 100+ integration tests, E2E test suite
+- **Phase Status**: Phase 10 (Production Hardening) — Load testing ✅, Performance tuning ✅, Chaos engineering ✅
 
 ## Services & Ports
 
 | Service | Port | Database |
 |---------|------|----------|
-| Authentication | 8001 | `smarttrade_authentication_service` |
-| Mock Service | 8002 | `smarttrade_mock_service` |
-| Market Data (MDS) | 8004 | `smarttrade_market_data_service` |
-| Broker Adapter (BAS) | 8005 | `smarttrade_broker_adapter_service` |
-| Frontend | 5173 | — |
+| Authentication Service | 8001 | `smarttrade_authentication_service` |
+| Paper Broker Service | 8002 | `smarttrade_paper_broker_service` |
+| Market Data Service (MDS) | 8004 | `smarttrade_market_data_service` |
+| Broker Adapter Service (BAS) | 8005 | `smarttrade_broker_adapter_service` |
+| Frontend | 5173 | — (served by Node.js) |
 
-## Legacy Docs
+## Documentation Organization
 
-- [Architecture Implementation Plan](docs/ARCHITECTURE_IMPLEMENTATION_PLAN.json)
-- [Fyers Integration Guide](docs/FYERS_INTEGRATION_GUIDE.md)
-- [Transaction Boundaries](docs/TRANSACTION_BOUNDARIES.md)
-- [Phase 5 Frontend Integration](docs/PHASE_5_FRONTEND_INTEGRATION.md)
+This repository contains **cross-service** architecture and planning documents. Service-specific implementation documentation lives in each service's `docs/` directory to keep it close to the code and easy to maintain.
+
+### When to Look Where
+
+| What You Need | Where to Look |
+|---------------|---------------|
+| Overall architecture & phases | [smarttrade-architecture-v3.4-current.md](smarttrade-architecture-v3.4-current.md) (this repo) |
+| BAS implementation details (Order State Machine, Orchestrator, etc.) | [`broker-adapter-service/docs/INDEX.md`](../broker-adapter-service/docs/INDEX.md) |
+| MDS implementation | [`market-data-service/docs/`](../market-data-service/docs/) |
+| Paper Broker Service implementation | [`mock-service/docs/`](../mock-service/docs/) |
+| E2E test strategy | [`smarttrade-tests/docs/E2E_TESTING_STRATEGY.md`](../smarttrade-tests/docs/E2E_TESTING_STRATEGY.md) |
+| Fyers API reference | [`broker-adapter-service/docs/fyers-api-reference/`](../broker-adapter-service/docs/fyers-api-reference/) |
+| Deployment & infrastructure | [`smarttrade-deployment/`](../smarttrade-deployment/) |
+
+### History
+
+Archived documentation for completed phases (Phases 1-9) is available in each service's `docs/archive/` directory for reference. Do not implement from archived docs — use current docs in service `docs/` directories.
