@@ -447,8 +447,7 @@ POST   /api/v1/strategies           — Create strategy (Phase 4)
 PUT    /api/v1/strategies/{id}      — Update strategy
 GET    /api/v1/strategies           — List strategies
 
-WS     /api/v1/orders/ws            — Order updates
-WS     /api/v1/positions/ws         — Position updates
+WS     /api/v1/ws                   — Account event stream (orders, trades, positions)
 ```
 
 ---
@@ -475,7 +474,7 @@ GET    /api/v1/instruments/{symbol}  — Get instrument detail
 GET    /api/v1/data/history/{broker_id}/{instrument_id}  — Historical candles
 GET    /api/v1/data/quotes/{broker_id}  — Get quote snapshot
 
-WS     /ws                           — Real-time quote stream
+WS     /ws                           — Real-time market data (quotes, depth, candles) ONLY
 ```
 
 **Routes Not Yet Implemented**:
@@ -613,6 +612,52 @@ class AIOrchestrator:
 - ✅ Frontend displays AI recommendations
 - ❌ AI never triggers execution
 - ❌ If AI wants to "trade", it publishes event that frontend ignores
+
+---
+
+### 3.5a WebSocket Domain Separation Principle
+
+**Architecture Decision** (April 2026): Frontend connects to TWO independent WebSocket streams, each owned by its service.
+
+**Principle**: Each service owns its WebSocket delivery responsibility. No service relays another service's events.
+
+#### 1. MDS WebSocket (`ws://mds:8004/ws`) — Market Data Only
+- **Ownership**: Market Data Service
+- **Content**: Real-time quotes, depth, market indices
+- **Scope**: Public (all subscribed users)
+- **Authentication**: JWT with market data scope
+- **Data Source**: FyersDataSocket (direct connection, no relay)
+
+#### 2. BAS WebSocket (`ws://bas:8005/api/v1/ws`) — Account Events Only
+- **Ownership**: Broker Adapter Service
+- **Content**: User-specific execution events (orders, trades, positions)
+- **Scope**: User-isolated (only that user's events, enforced by JWT user_id claim)
+- **Authentication**: JWT with user_id claim
+- **Data Source**: EventBus → BAS WebSocket consumer (sequence-guaranteed delivery)
+- **Ordering**: Strictly monotonic sequence numbers per user+account partition
+- **Replay Protocol**: Client sends `last_sequence` on reconnect; server replays missed events
+
+#### 3. Domain Ownership Principle
+- **MDS owns market data delivery**: Quotes, depth, candles
+- **BAS owns execution event delivery**: Orders, trades, positions
+- **No relay**: MDS does NOT relay BAS events; BAS does NOT relay market data
+- **Clear boundaries**: Each service responsible for its own WebSocket
+
+#### 4. Benefits of Separation
+| Aspect | Benefit |
+|--------|---------|
+| **Failure Isolation** | Market data resilient to trading outages; trading events resilient to market data outages |
+| **Latency** | Trading events reach UI directly (1 hop) instead of via MDS relay (2 hops) |
+| **Scalability** | Each stream scales independently; different SLAs per domain |
+| **Ordering Guarantees** | BAS WebSocket provides sequence numbers for replay; MDS provides best-effort ordering |
+| **Architecture** | Aligns with industry standard (Interactive Brokers, TD Ameritrade, Fyers all do this) |
+| **Clarity** | Event ownership matches WebSocket ownership; no ambiguity about data source |
+
+#### 5. Migration Path (Phased)
+- **Phase 1 (Current)**: Introduce BAS WebSocket alongside existing patterns; both active
+- **Phase 2 (Frontend migration)**: All account event consumers migrate to BAS WebSocket
+- **Phase 3 (Deprecate)**: MDS no longer consumes order/trade/position events
+- **Phase 4 (Cleanup)**: Remove relay code from MDS; MDS pure market data
 
 ---
 
@@ -908,10 +953,12 @@ from smarttrade_common.database import AsyncSession
 ```
 Kafka topic ACLs:
 ├─ BAS can write to: order.*.v1, position.*.v1, trade.*.v1
+├─ BAS WS consumer can read from: order.*.v1, trade.*.v1, position.*.v1
 ├─ AI can read from: order.*.v1, trade.*.v1, strategy.*.v1
 ├─ AI can write to: ai.*.v1
 ├─ Notification can read from: ai.*.v1, risk.*.v1, order.*.v1
 ├─ Notification can write to: notification.*.v1
+├─ MDS CANNOT read from: order.*.v1, trade.*.v1, position.*.v1 (no relay responsibility)
 └─ Journal can read from: trade.*.v1, ai.*.v1
     Journal can write to: journal.*.v1
 ```
@@ -2266,8 +2313,8 @@ async def resolve_conflict(self, orders: List[Order]) -> Order:
 | Service | Owns | Does NOT Own | Publishes | Consumes |
 |---------|------|--------------|-----------|----------|
 | **Auth** | Users, JWT, RBAC | — | user.* events | — |
-| **BAS** | Orders, Positions, Risk, PIE | Market data ✅, Audit logs ⚠️, Metadata ⚠️ | order.*, position.* | market_data.quote, user requests |
-| **MDS** | Instruments, Quotes, Calendar | Orders, Positions, Greeks (Phase 2), Execution | market_data.quote | broker.session |
+| **BAS** | Orders, Positions, Risk, PIE, WebSocket for account events | Market data ✅, MDS's market WebSocket, Audit logs ⚠️, Metadata ⚠️ | order.*, position.*, trade.* | market_data.quote, user requests |
+| **MDS** | Instruments, Quotes, Calendar, WebSocket for market data | Orders, Positions, Execution, Account events ✅ | market_data.quote | broker.session |
 | **Journal Service** (future) | Trade history, Audit logs ⚠️ | Execution, Position mgmt | journal.entry.created.v1 | trade.*.v1, action.executed.v1 |
 | **Strategy** (future) | Strategies, Backtest | Execution, Positions | strategy.signal | market_data.quote, signal.* |
 | **smarttrade-common** | Auth, DB, Events, Errors | Business logic | — | (used by all) |
@@ -2536,11 +2583,20 @@ Strategy Runtime
 Audit Logger
   │ 1. Log fill immutably
   ↓
-Event: order.filled
-  │ (published after all state updates)
+EventBus
+  │ 1. Publish order.filled.v1, trade.executed.v1, position.updated.v1
   ↓
-WebSocket to Frontend
-  └─ Real-time update of positions, P&L, orders
+BAS WebSocket Consumer
+  │ 1. Read events from EventBus partition (user_id)
+  │ 2. Assign sequence numbers
+  │ 3. Queue for delivery
+  ↓
+BAS WebSocket (`ws://bas:8005/api/v1/ws`)
+  │ 1. User isolation (JWT user_id claim)
+  │ 2. Sequence-based ordering
+  ↓
+Frontend (Real-time update)
+  └─ Display positions, P&L, orders (orders, trades, positions)
 ```
 
 ### Broker Sync Flow

@@ -18,7 +18,7 @@ Design documents, architecture references, guides, and project planning for the 
 - **Broker Adapter Service (BAS)**: See [`broker-adapter-service/docs/INDEX.md`](../broker-adapter-service/docs/INDEX.md) for complete documentation
   - Includes: Order State Machine, Execution Orchestrator, Idempotency, Outbox Pattern, Risk Engine, Fyers API reference
 - **Market Data Service (MDS)**: See [`market-data-service/docs/`](../market-data-service/docs/) for documentation
-- **Paper Broker Service** (formerly Mock Service): See [`mock-service/docs/`](../mock-service/docs/) for documentation
+- **Paper Broker Service** (formerly Mock Service): See [`paper-broker-service/docs/`](../paper-broker-service/docs/) for documentation
 - **Authentication Service**: See [`authentication-service/docs/`](../authentication-service/docs/) for documentation
 
 ### Testing & Deployment
@@ -58,7 +58,7 @@ This repository contains **cross-service** architecture and planning documents. 
 | Overall architecture & phases | [smarttrade-architecture-v3.4-current.md](smarttrade-architecture-v3.4-current.md) (this repo) |
 | BAS implementation details (Order State Machine, Orchestrator, etc.) | [`broker-adapter-service/docs/INDEX.md`](../broker-adapter-service/docs/INDEX.md) |
 | MDS implementation | [`market-data-service/docs/`](../market-data-service/docs/) |
-| Paper Broker Service implementation | [`mock-service/docs/`](../mock-service/docs/) |
+| Paper Broker Service implementation | [`paper-broker-service/docs/`](../paper-broker-service/docs/) |
 | E2E test strategy | [`smarttrade-tests/docs/E2E_TESTING_STRATEGY.md`](../smarttrade-tests/docs/E2E_TESTING_STRATEGY.md) |
 | Fyers API reference | [`broker-adapter-service/docs/fyers-api-reference/`](../broker-adapter-service/docs/fyers-api-reference/) |
 | Deployment & infrastructure | [`smarttrade-deployment/`](../smarttrade-deployment/) |

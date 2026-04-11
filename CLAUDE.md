@@ -30,7 +30,7 @@ smarttrade-project/
 Service-specific documentation is maintained in each service repository:
 - `broker-adapter-service/docs/` — BAS implementation, LLDs, Fyers API reference
 - `market-data-service/docs/` — MDS implementation
-- `mock-service/docs/` — Paper Broker Service implementation
+- `paper-broker-service/docs/` — Paper Broker Service implementation
 - `authentication-service/docs/` — Auth service documentation
 - `smarttrade-tests/docs/` — E2E testing strategy
 - `smarttrade-deployment/` — Infrastructure and deployment configuration
@@ -160,7 +160,7 @@ All service-specific documentation is maintained in the service's own repository
   - Includes: Order State Machine, Execution Orchestrator, Outbox Pattern, Idempotency, Risk Engine
   - Includes: Fyers API reference (complete API documentation)
 - **Market Data Service**: See `market-data-service/docs/`
-- **Paper Broker Service**: See `mock-service/docs/`
+- **Paper Broker Service**: See `paper-broker-service/docs/`
 - **E2E Testing**: See `smarttrade-tests/docs/E2E_TESTING_STRATEGY.md`
 
 These docs are the source of truth for implementation. Do not reference old/archived documentation.
