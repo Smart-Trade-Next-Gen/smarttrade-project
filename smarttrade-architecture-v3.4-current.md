@@ -365,8 +365,12 @@ class UserRegisteredV1(BaseEvent):
 
 #### Layer 1: Broker Adapter Plugins
 - **Responsibility**: Translate SmartTrade → Broker API calls
-- **Implementations**: `FyersAdapter`, `MockAdapter` (future: Zerodha, IBKR, Alpaca)
+- **Implementations**: 
+  - `FyersAdapter` (live broker integration)
+  - `MockAdapter` → **Paper Broker Service** (paper trading backend; see [`paper-broker-service/docs/Paper_Broker_Service_HLD_v1.md`](../paper-broker-service/docs/Paper_Broker_Service_HLD_v1.md))
+  - (future: Zerodha, IBKR, Alpaca)
 - **Patterns**: Plugin architecture; adapter interface standardized
+- **Design Note**: PBS behaves like external broker (no SmartTrade event bus access); BAS translates WebSocket updates to order.*.v1 events
 
 #### Layer 2: Broker Session Management
 - **Classes**: `UserBrokerSession`, `UserBrokerAccountSession`
@@ -454,39 +458,131 @@ WS     /api/v1/ws                   — Account event stream (orders, trades, po
 
 ### 3.3 Market Data Service (Port 8004)
 
-**Responsibility**: Real-time quotes, instrument resolution, trading calendar.
+**Responsibility**: Real-time quotes, instrument resolution, trading calendar, OHLC aggregation, IV calculation, backtest data feed.
+
+**Core Principle (v2.1 Production Hardening)**: Deterministic, idempotent, memory-safe market data platform.
 
 **Implemented Components**:
 1. **Instrument Service** ✅ — Lookup, resolution, broker mapping
 2. **Quote Service** ✅ — Real-time quote streaming, WebSocket fan-out
-3. **Trading Calendar** ✅ — Market holidays, session times
+3. **Trading Calendar** ✅ — Market holidays, session times, expected_candles_per_day
 4. **Event Publishing Layer** ✅ — DomainEventPublisher integration
 
-**Deferred Components** (Phase 2 Post-Launch):
-- Greeks Calculator — Black-Scholes calculation (single + multi-leg)
-- IV Metrics Service — Implied volatility, volatility surface
-- Option Chain Service — Chain retrieval, caching, refresh scheduling
+**Phase 0-4 Implementation (Q2 2026, Parallel to Frontend Phase 5)**:
 
-**Routes Implemented**:
+**Phase 0: Foundation** ✅ READY
+- **Bucket-Scoped Tick Buffer**: Per-(symbol, bucket_start) isolation; prevents cross-bucket contamination
+- **Time-Driven Finalization Scheduler**: Runs every 60 seconds; closes buckets by wall-clock time (not tick arrival)
+- **Memory Management Service**: TTL cleanup for finalized buckets (10-minute retention); prevents unbounded growth
+- **Deterministic Idempotency**: SHA256 keys (symbol:timestamp:price:volume) stable across processes
+- **PostgreSQL Schema**: Partitioned historical_candles table with idempotency_key UNIQUE constraint
+
+**Phase 1: Historical Data Feed**
+- Broker daily OHLC backfill (Fyers, Paper Broker)
+- Gap detection & logging (missing candles, broker outages)
+- Data quality metrics & validation (outliers, volume spikes)
+
+**Phase 2: Multi-Interval Derivation**
+- 5m/15m/1h/1d derivation from 1m candles
+- Exact boundary conditions (watermark-based finalization)
+- Idempotent derived candle inserts
+
+**Phase 3: IV & Greeks Enhancement**
+- Config-driven IV calculation (Black-Scholes, no hardcoded params)
+- Real-time IV surface updates (on quote refresh)
+- Multi-leg Greeks support (option spreads)
+
+**Phase 4: Backtest Data Feed**
+- Backtest API: `/api/v1/data/ohlc?symbol=SBIN-EQ&interval=5m&from=2025-01-01`
+- Replay cursor abstraction (seek, peek, progress)
+- Corporate action application (dividends, splits, bonus)
+
+**Routes (Real-Time Implemented)**:
 ```
 GET    /api/v1/instruments           — Lookup instruments
 GET    /api/v1/instruments/{symbol}  — Get instrument detail
-GET    /api/v1/data/history/{broker_id}/{instrument_id}  — Historical candles
 GET    /api/v1/data/quotes/{broker_id}  — Get quote snapshot
 
-WS     /ws                           — Real-time market data (quotes, depth, candles) ONLY
+WS     /ws                           — Real-time market data (quotes, depth) ONLY
 ```
 
-**Routes Not Yet Implemented**:
+**Routes (Phase 0-4 Roadmap)**:
 ```
-GET    /api/v1/greeks                — Get Greeks for option (Phase 2)
-GET    /api/v1/options/{symbol}      — Get option chain (Phase 2)
-GET    /api/v1/iv_metrics/{symbol}   — Get IV surface (Phase 2)
-WS     /ws/greeks                    — Real-time Greeks updates (Phase 2)
+GET    /api/v1/data/ohlc             — Get historical OHLC candles (Phase 1)
+GET    /api/v1/greeks                — Get Greeks for option (Phase 3)
+GET    /api/v1/options/{symbol}      — Get option chain (Phase 3)
+GET    /api/v1/iv_metrics/{symbol}   — Get IV surface (Phase 3)
+WS     /ws/greeks                    — Real-time Greeks updates (Phase 3)
 ```
 
 **Events Published**:
-- `market_data.quote` ✅ (real-time price)
+- `market_data.quote.v1` ✅ (real-time price)
+- `market_data.candle.finalized.v1` 🔄 (1m/5m/15m/1h/1d candles, deterministic, with idempotency_key)
+- `market_data.candle_gap.v1` 🔄 (missing candles, severity, context)
+- `market_data.iv.calculated.v1` 🔄 (option IV, config-driven, with quality flags)
+
+**Candle Event Schema (v2.1)**:
+```python
+class CandleFinalizedV1(BaseEvent):
+    symbol: str
+    interval: str  # "1m", "5m", "15m", "1h", "1d"
+    timestamp: datetime  # UTC
+    open, high, low, close: Decimal  # Precise, not float
+    volume: int
+    tick_count: int
+    
+    # v2.1 additions
+    source: str  # "live", "derived", "broker_daily", "broker_1m_backfill"
+    version: int  # Schema version (allows future upgrades)
+    is_complete: bool  # False if gap detected
+    confidence: str  # "high", "medium", "low"
+    quality_flags: List[str]  # ["outlier_price"], ["volume_spike"], []
+    
+    # Audit trail
+    created_at: datetime
+    updated_at: datetime
+    last_corrected_at: datetime | None
+    
+    # Idempotency (critical for distributed safety)
+    idempotency_key: str  # SHA256(symbol:interval:timestamp), stable across processes
+```
+
+**Production Guarantees (v2.1)**:
+- ✅ **Deterministic**: Same ticks in any order → identical candle (verified 10× in tests)
+- ✅ **Idempotent**: All operations safe to retry; deduplication via DB UNIQUE constraints
+- ✅ **Distributed-Safe**: Idempotency keys stable across processes; no process-local state
+- ✅ **Memory-Safe**: No unbounded growth; TTL cleanup every 10 minutes
+- ✅ **Resilient**: Circuit breaker on broker outages; rate limiting (10K ticks/sec); graceful degradation
+
+**Consumption Model** (NOT Production Push):
+- BAS consumes MDS events via Redis Streams (durable, ordered, idempotent)
+- Strategy Service consumes via backtest API (replay cursor for deterministic backtesting)
+- Frontend consumes WebSocket for real-time (best-effort, not durable)
+
+#### MDS Service Boundaries (Strict Separation of Concerns)
+
+**MDS OWNS** ✅:
+- Real-time quote ingestion & WebSocket fan-out
+- Instrument resolution & broker mapping
+- Trading calendar (market hours, holidays, expected_candles)
+- 1m candle aggregation from ticks (bucket-scoped buffering)
+- Multi-interval derivation (5m/15m/1h/1d from 1m)
+- IV calculation (Black-Scholes, config-driven)
+- Backtest data feed (historical OHLC with gap detection)
+- Candle versioning & source tracking
+- Gap detection & severity classification
+
+**MDS DOES NOT OWN** ❌:
+- Trading events (orders, positions, trades) → **BAS responsibility**
+- Signal generation (indicators, patterns) → **Strategy Service responsibility**
+- Risk calculation (limits, loss, exposure) → **BAS Risk Engine responsibility**
+- User authentication → **Auth Service responsibility**
+- Execution state (which orders filled, what's pending) → **BAS Order State Machine**
+
+**Critical: NO Mutation of Historical Data**
+- Late ticks: Only `discard` or `log_only` policies allowed at runtime
+- Corrections: Require explicit versioning mechanism + DB migration (not automatic)
+- Determinism: Same candle input must always produce identical OHLC (no retroactive adjustments)
 
 ---
 
