@@ -1,8 +1,8 @@
-# SmartTrade Architecture v3.4 — CURRENT
+# SmartTrade Architecture v3.4 — CURRENT + Market Data Distribution Update
 
-**Status**: In Production (Core Complete) | Phase 10: Production Hardening
-**Date**: 2026-04-10
-**Version**: 3.4 — CURRENT (Active)
+**Status**: In Production (Core Complete) | Phase 10: Production Hardening + Phase 11: Market Data Refactor (Architecture Spec Complete)
+**Date**: 2026-04-10 (original) → 2026-04-20 (Market Data Distribution Architecture v1.0)
+**Version**: 3.4 — CURRENT + Market Data Distribution Pattern v3.5+ (Architecture Spec Phase)
 **Previous Milestone**: v3.2 (March 2026 — Core implementation complete)
 **Current Phase**: Phase 10: Production Hardening (3/12 tasks complete)
 **Production Status**: All critical components deployed and tested. Core architecture stable. Phase 10 focuses on monitoring, observability, and deployment hardening.
@@ -61,8 +61,9 @@ SmartTrade v3.4 is a **microservices-based, broker-agnostic trading platform** w
 | PIE (Position Intelligence) | ✅ | Auto-entry, kill-switch, rule triggering |
 | Market Data | ✅ | Quotes, instrument resolution, trading calendar |
 | Authentication | ✅ | JWT, RBAC, bcrypt |
-| **Quote Cache (BAS)** | ⚠️ | In-memory local cache; should consume from MDS events |
-| **Instrument Cache (BAS)** | ⚠️ | Local metadata cache; duplicates MDS responsibility |
+| **Quote Cache (BAS)** | ⚠️ | In-memory local cache; should consume from Redis Streams (market.quote.v1) + Redis KV with freshness decision logic |
+| **Instrument Cache (BAS)** | ⚠️ | Local metadata cache; duplicates MDS responsibility; should fetch from MDS API with 24h TTL cache |
+| **Quote Distribution (MDS→BAS/PBS)** | ⏳ | WebSocket-based (non-durable); should use Redis Streams + KV pattern (durable, ordered, idempotent, replay-safe) |
 | **Action Logging (BAS)** | ⚠️ | Stores PIE logs in BAS DB; should be event-driven (Journal Service) |
 | **Execution Orchestrator** | ❌ | No centralized queue |
 | **Idempotency** | ❌ | Not integrated into endpoints |
@@ -102,24 +103,54 @@ SmartTrade v3.4 is a **microservices-based, broker-agnostic trading platform** w
 
 | Issue | Location | Impact | Fix Effort | Priority |
 |-------|----------|--------|-----------|----------|
-| **Quote Cache Duplication** | `broker_adapter_service/quote_store.py` | Violates MDS ownership; creates stale price risk | 4 hrs | **HIGH** |
+| **Quote Cache Duplication** | MDS + BAS + PBS | Violates MDS ownership; non-durable (no replay); creates stale price risk | Implement Redis Streams + KV pattern; BAS/PBS consumer groups | **HIGH** |
 | **Instrument Cache Duplication** | `broker_adapter_service/instrument_cache.py` | Duplicates MDS; metadata divergence risk | 6 hrs | **HIGH** |
 | **Action Logging Sync** | `broker_adapter_service/action_log_service.py` | Stores logs in BAS DB; should be event-driven | 8 hrs | **MEDIUM** |
 | **Portfolio Mixed with Position** | `broker_adapter_service/portfolio_service.py` | Violates single responsibility; blocks portfolio-level rules | Refactor Phase 2-3 | **MEDIUM** |
 
 **Total Phase 1 Cleanup Effort**: ~18 hours (reduce by moving quote/instrument cache to consumption model)
 
-**Recommended Approach**:
+**Recommended Approach** (Redis Streams + KV Pattern):
 ```
-BEFORE: BAS maintains local cache of quotes & instruments
-  quote_store.py (local in-memory)
-  instrument_cache.py (local with TTL refresh)
+BEFORE: BAS maintains local cache of quotes & instruments via WebSocket
+  quote_store.py (in-memory dict, non-durable)
+  MDS WebSocket subscription (per-user, fragile)
+  No event trail or replay capability
 
-AFTER: BAS consumes from event stream
-  - Subscribe to market_data.quote events from MDS
-  - Instrument metadata from MDS API (with fallback 1-hour local cache)
-  - No refresh loops; event-driven updates
+AFTER: BAS consumes from durable Redis Streams + KV pattern (v3.5+)
+  
+MDS PUBLISHES (Redis → KV first, then Stream):
+  1. Write Redis KV: key=quote:{instrument_id}, TTL=60s
+     Value: { instrument_id, ltp, bid, ask, timestamp, sequence_number }
+  2. Publish Redis Stream: stream=market.quote.v1
+     Fields: { instrument_id, ltp, bid, ask, timestamp, sequence_number }
+  
+  → Guarantees: KV-first ordering; sequence_number per instrument (Redis INCR on seq:{id})
+
+BAS CONSUMES (Redis Stream + KV for freshness):
+  1. Consumer group: bas-quote-consumer on market.quote.v1
+  2. On each event:
+     - Check sequence_number for idempotency (skip if already seen)
+     - Fetch Redis KV for latest snapshot
+     - Compare event.ltp vs kv.ltp (prefer KV if lag > 100ms OR |divergence| > 0.1%)
+     - Update in-memory quote_store
+     - ACK stream message
+  
+  → Guarantees: Durable, ordered, idempotent, replay-safe; stale-price protection
+
+PBS FOLLOWS SAME PATTERN:
+  - Consumer group: pbs-quote-consumer on market.quote.v1
+  - Updates price_cache → triggers order execution
+  - Same freshness decision logic as BAS
 ```
+
+**Key Benefits**:
+- ✅ Durable event log (Redis Streams) enables replay and audit
+- ✅ Latest snapshot in Redis KV ensures sub-100ms freshness
+- ✅ Sequence numbers prevent duplicate fills and enable idempotency
+- ✅ Eliminates per-user WebSocket clients (simplified, centralized)
+- ✅ Solves stale-price risk by comparing stream event vs KV snapshot
+
 
 ### Phase 2-3 Refactoring (Blocking Future Features)
 
@@ -230,9 +261,9 @@ await kafka_producer.send(
 | Service | Responsibility | Consumes | Produces |
 |---------|---|---|---|
 | **Auth** | User identity, JWT, RBAC | — | user.registered.v1, user.logged_in.v1 |
-| **MDS** | Real-time quotes, instrument resolution, trading calendar | broker.session.v1 | market_data.quote.v1 |
+| **MDS** | Real-time quotes, instrument resolution, trading calendar | broker.session.v1 | market.quote.v1 |
 | **BAS** | Orders, positions, risk, execution | user requests + events | order.*.v1, position.*.v1, portfolio.*.v1, trade.*.v1 |
-| **Strategy** (future) | User-defined algos, backtesting | market_data.quote.v1, signal.*.v1 | strategy.signal.v1 |
+| **Strategy** (future) | User-defined algos, backtesting | market.quote.v1, signal.*.v1 | strategy.signal.v1 |
 | **AI Orchestrator** (NEW) | LLM insights, trade scoring, nudges | trade.*.v1, order.*.v1, strategy.*.v1 | ai.trade.score.v1, ai.nudge.v1, ai.warning.v1 |
 | **Notification Service** (NEW) | Alert delivery (push, email, WS) | ai.*.v1, risk.*.v1, order.*.v1 | notification.sent.v1, notification.failed.v1 |
 | **Journal Service** (NEW) | Trade history, behavioral analytics | trade.*.v1, ai.*.v1 | journal.entry.created.v1, journal.insight.generated.v1 |
@@ -516,7 +547,7 @@ WS     /ws/greeks                    — Real-time Greeks updates (Phase 3)
 ```
 
 **Events Published**:
-- `market_data.quote.v1` ✅ (real-time price)
+- `market.quote.v1` ✅ (real-time price)
 - `market_data.candle.finalized.v1` 🔄 (1m/5m/15m/1h/1d candles, deterministic, with idempotency_key)
 - `market_data.candle_gap.v1` 🔄 (missing candles, severity, context)
 - `market_data.iv.calculated.v1` 🔄 (option IV, config-driven, with quality flags)
@@ -583,6 +614,124 @@ class CandleFinalizedV1(BaseEvent):
 - Late ticks: Only `discard` or `log_only` policies allowed at runtime
 - Corrections: Require explicit versioning mechanism + DB migration (not automatic)
 - Determinism: Same candle input must always produce identical OHLC (no retroactive adjustments)
+
+#### 3.3.1 Market Data Distribution Architecture (Redis Streams + KV Pattern v3.5+)
+
+**Problem Solved**: BAS and PBS currently receive quotes via per-user WebSocket clients connected to MDS. This violates MDS ownership, lacks durability/replayability, and creates fragile distributed state. MDS must publish a durable, ordered, idempotent event stream that all backend services consume from.
+
+**Solution: Dual-Channel Redis Architecture**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ MDS (Market Data Service)                                   │
+│ Ingests broker WebSocket, normalizes                        │
+└────────────────┬────────────────────────────────────────────┘
+                 │ On each price tick (normalized):
+                 ├─→ (1) Write Redis KV: quote:{instrument_id}
+                 │       TTL=60s, value={ ltp, bid, ask, ts, seq# }
+                 │
+                 └─→ (2) Publish Redis Stream: market.quote.v1
+                         Fields={ instrument_id, ltp, bid, ask, ts, seq# }
+                         
+┌──────────────────────────────────────────────────────────────┐
+│ Redis (Dual Store)                                           │
+│                                                              │
+│ KV (Latest Snapshot):                                        │
+│   Key: quote:{instrument_id}                                │
+│   Value: { instrument_id, ltp, bid, ask, timestamp,         │
+│            sequence_number }                                 │
+│   TTL: 60s                                                   │
+│   Purpose: O(1) freshness check; quick snapshot reads        │
+│                                                              │
+│ Stream (Ordered Event Log):                                  │
+│   Key: market.quote.v1                                 │
+│   Fields: { instrument_id, ltp, bid, ask, timestamp,        │
+│             sequence_number }                                │
+│   Retention: 90 days (XTRIM)                                │
+│   Purpose: Durable, ordered, replay-safe event log         │
+└──────────────────┬───────────────┬──────────────┬───────────┘
+                   │               │              │
+        ┌──────────┘       ┌───────┘      ┌──────┘
+        │                  │              │
+        ▼                  ▼              ▼
+    ┌─────────┐      ┌─────────┐   ┌─────────┐
+    │ BAS     │      │ PBS     │   │ Strategy│
+    │ Consumer│      │Consumer │   │(Backtest)
+    │ Group   │      │ Group   │   │ API    │
+    │bas-*   │      │pbs-*   │   │        │
+    └─────────┘      └─────────┘   └─────────┘
+    
+Consumer Algorithm (BAS & PBS):
+  while running:
+    entries = XREADGROUP(
+      group="bas-quote-consumer",
+      consumer="bas-{hostname}",
+      streams={"market.quote.v1": ">"},
+      block=100ms
+    )
+    for msg_id, fields in entries:
+      instrument_id = fields["instrument_id"]
+      seq = int(fields["sequence_number"])
+      
+      # Idempotency: skip if already processed
+      if seq <= last_seen[instrument_id]:
+        XACK(stream, group, msg_id)
+        continue
+      
+      # Freshness decision: stream event vs KV snapshot
+      event_ltp = Decimal(fields["ltp"])
+      event_ts = iso_to_datetime(fields["timestamp"])
+      lag_ms = (now_utc - event_ts).total_seconds() * 1000
+      
+      if lag_ms > MAX_ALLOWED_LAG_MS:
+        # Event is stale; use KV snapshot
+        kv_ltp = KV_GET(f"quote:{instrument_id}")["ltp"]
+        selected_price = kv_ltp or event_ltp
+      elif abs(kv_ltp - event_ltp) / event_ltp > PRICE_THRESHOLD:
+        # Divergence detected; prefer freshness (KV)
+        selected_price = kv_ltp or event_ltp
+      else:
+        # Event is fresh and aligned; use it
+        selected_price = event_ltp
+      
+      # Update local cache
+      quote_store.update(instrument_id, selected_price, now_utc)
+      
+      # Mark processed
+      last_seen[instrument_id] = seq
+      XACK(stream, group, msg_id)
+```
+
+**Config Constants**:
+| Constant | Value | Rationale |
+|----------|-------|-----------|
+| `MAX_ALLOWED_LAG_MS` | 100 | If event > 100ms old, prefer KV (more current) |
+| `PRICE_THRESHOLD_PERCENT` | 0.1 | If divergence > 0.1%, prefer KV (drift protection) |
+| `STREAM_RETENTION_DAYS` | 90 | Replay window for debugging; trading events kept |
+| `KV_TTL_SECONDS` | 60 | Quote snapshot stale after 1 minute; forces stream read |
+| `CONSUMER_BLOCK_MS` | 100 | Balances latency vs. CPU polling |
+
+**Sequence Number Generation (per Instrument)**:
+- Redis INCR on key `seq:{instrument_id}` at MDS publication time
+- Strictly increasing, persists across MDS restarts
+- Enables idempotency: skip duplicate fills with same seq#
+- Example: INCR `seq:SBIN-EQ` → 42101, 42102, 42103 ...
+
+**Guarantees**:
+1. **Durable**: All quotes in Redis Stream (persists Redis restarts)
+2. **Ordered**: Stream maintains FIFO per key; idempotency via seq# prevents duplicates
+3. **Idempotent**: seq# + consumer group ACK pattern prevents double-processing
+4. **Replay-Safe**: Read stream from beginning; same seq# will be skipped (idempotent)
+5. **Freshness-Protected**: KV fallback ensures stale event prices are not used
+6. **Single Source of Truth**: MDS is sole publisher; BAS/PBS are read-only consumers
+
+**Anti-Patterns** (FORBIDDEN):
+- ❌ BAS/PBS connecting directly to broker WebSocket for quotes
+- ❌ Backend services opening WebSocket to MDS for quote data
+- ❌ Bypassing Redis Stream; reading KV directly without stream ACK
+- ❌ Publishing to stream before KV write completes (violates atomicity)
+- ❌ Prices as float (use Decimal in KV; Decimal string in Stream JSON)
+- ❌ Missing sequence_number in any quote event
 
 ---
 

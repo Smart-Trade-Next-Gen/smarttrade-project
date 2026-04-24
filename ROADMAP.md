@@ -1,6 +1,6 @@
 # SmartTrade Platform — Product Roadmap
 
-**Last Updated:** 2026-03-21
+**Last Updated:** 2026-04-18 (MDS Phase 0-4 alignment added)
 
 ---
 
@@ -10,7 +10,8 @@
 |---------|--------|---------|
 | Authentication Service | Production Ready ✅ | Full test suite |
 | Broker Adapter Service | Production Ready ✅ | 250+ tests |
-| Market Data Service | Production Ready ✅ | Unit + integration tests |
+| Market Data Service (Real-time) | Production Ready ✅ | Quotes, instruments, WebSocket |
+| Market Data Service (OHLC/Backtest) | Phase 0-4 In Progress 🔄 | PostgreSQL schema, aggregation, determinism |
 | Mock Service | Production Ready ✅ | Mirrors BAS |
 | Frontend | In Progress 🔄 | Phase 5: API integration |
 | PIE Engine | Production Ready ✅ | Full lifecycle tested |
@@ -69,6 +70,47 @@
 - [ ] Playwright E2E: PIE strategy activation → kill switch
 - [ ] WebSocket reconnection tests
 
+### MDS Phase 0-4 Implementation (Parallel: Apr–Jun 2026)
+
+**Phase 0: Foundation (Weeks 1-2, Apr)**
+- [ ] PostgreSQL schema (partitioned historical_candles table with idempotency keys, TTL indexes)
+- [ ] Trading calendar seeding (market hours, holidays, expected_candles_per_day)
+- [ ] Bucket-scoped tick buffer (per-(symbol, bucket_start) isolation, no cross-contamination)
+- [ ] Time-driven finalization scheduler (runs every 60s, independent of tick arrival)
+- [ ] Memory management service (TTL cleanup for finalized buckets, stale symbol pruning)
+- [ ] Determinism test suite (20+ tests: same input → identical output, verified 10 times)
+- [ ] Memory leak tests (verify TTL cleanup prevents unbounded growth)
+
+**Phase 1: Historical Data Feed (Weeks 3-4, Apr–May)**
+- [ ] Broker daily OHLC backfill (Fyers, Paper Broker)
+- [ ] Gap detection & logging (missing candles, broker outages)
+- [ ] Data quality metrics & validation (outliers, volume spikes)
+- [ ] Integration tests (backfill scenarios, gap detection)
+
+**Phase 2: Multi-Interval Derivation (Weeks 5-6, May)**
+- [ ] 5m candle derivation from 1m (exact boundary conditions)
+- [ ] 15m/1h/1d derivation (watermark-based finalization)
+- [ ] Idempotent derived candle inserts (SHA256 idempotency keys)
+- [ ] Interval boundary tests (verify completeness before derivation)
+
+**Phase 3: IV & Greeks Enhancement (Weeks 7-8, May–Jun)**
+- [ ] Config-driven IV calculation (no hardcoded parameters)
+- [ ] Real-time IV surface updates (on quote refresh)
+- [ ] Multi-leg Greeks support (option spreads: bull call, iron condor, etc.)
+- [ ] Volatility skew/smile detection
+- [ ] Greeks accuracy tests (Black-Scholes edge cases)
+
+**Phase 4: Backtest Data Feed (Week 9, Jun)**
+- [ ] Backtest API: `/api/v1/data/ohlc?symbol=SBIN-EQ&interval=5m&from=2025-01-01`
+- [ ] Replay cursor abstraction (seek, peek_next, progress, is_complete)
+- [ ] Corporate action application (dividends, splits, bonus adjustments)
+- [ ] Gap rejection for incomplete data sets
+- [ ] Replay cursor tests (deterministic seek, progress tracking)
+
+**Total Effort**: ~400 hours (8 weeks parallel to Frontend Phase 5)  
+**Blocking Dependencies**: None (parallel track)  
+**Go-Live Gate**: Must complete before Q3 production trading launch
+
 ### Production Hardening (May–Jun 2026)
 
 **Infrastructure**
@@ -82,6 +124,16 @@
 - [ ] Prometheus alerting rules (circuit breaker open, P99 > 500ms)
 - [ ] Error rate alerts (Sentry integration)
 - [ ] PagerDuty integration for critical risk alerts
+- [ ] MDS memory metrics (mds_tick_buffers_count, mds_finalized_buckets_count, mds_active_symbols_count)
+- [ ] MDS latency tracking (bucket finalization duration, late tick arrival rates)
+- [ ] Circuit breaker state monitoring (tick ingestion protection)
+
+**MDS Infrastructure**
+- [ ] PostgreSQL partitioning strategy (historical_candles partitioned by month)
+- [ ] Redis Streams consumer group setup (backtest data subscription)
+- [ ] Scheduler resource allocation (time-driven finalization loop, 60s interval)
+- [ ] Load testing: 10K ticks/sec with circuit breaker active
+- [ ] Memory profiling: verify TTL cleanup prevents unbounded growth over 24h continuous run
 
 **Security Hardening**
 - [ ] API key rotation procedure
@@ -100,6 +152,12 @@
 - [ ] Zerodha OAuth flow (routes_oauth extension)
 - [ ] Instrument mapping for NSE/BSE/NFO via Kite instruments CSV
 - [ ] E2E tests with Kite sandbox
+
+**NOTE**: Zerodha integration will follow MDS v2.1 production-grade patterns established in Q2:
+- Broker-specific tick ingestion plugin with bucket-scoped buffering
+- Deterministic idempotency keys (SHA256-based)
+- Same late tick handling policy (discard/log_only)
+- Reuse Phase 0 determinism test suite for Zerodha plugin validation
 
 ### Advanced Risk Features
 - [ ] Intraday drawdown circuit breaker (% drawdown from daily high)
