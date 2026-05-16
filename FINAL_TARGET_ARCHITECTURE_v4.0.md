@@ -25,16 +25,18 @@
 - Execution event publishing (`order.filled.v1`, `trade.executed.v1`)
 - WebSocket account events to frontend (BAS-originated only)
 - ExecutionContext encapsulation (internal model for deterministic execution)
+- **Local replicated instrument master** (bootstrapped from MDS; zero runtime MDS calls during execution)
 
 **MUST NOT DO**:
 - ~~Maintain quote cache~~ (consume from Redis Streams)
-- ~~Resolve instrument metadata~~ (query MDS on-demand or cache with MDS as source)
+- ~~Resolve instrument metadata via synchronous MDS calls~~ (maintain local replicated copy via InstrumentSyncService)
 - ~~Store action logs~~ (publish action.executed.v1 events)
 - ~~Calculate portfolio-level Greeks~~ (Portfolio Service)
 - Call downstream services synchronously (all async via event responses)
 - Determine trading signals/strategy logic (Strategy Service)
 - Make trading decisions based on market conditions beyond risk validation
 - Handle external trades or broker reconciliation (Phase 3 future)
+- Call MDS REST API during order execution (all data must be pre-cached)
 
 **Data Ownership**:
 - Orders (all states)
@@ -51,24 +53,32 @@ ExecutionContext {
   order_id: UUID
   positions_snapshot: Dict[symbol, Position]  # from BAS DB, pre-fetched
   risk_snapshot: RiskState                    # margin, daily loss, position limits
-  quote_snapshot: Dict[symbol, Quote]        # from local QuoteStore
-  instrument_snapshot: Dict[symbol, Instrument]  # from local InstrumentCache
+  quote_snapshot: Dict[symbol, Quote]        # from local QuoteStore (fed by Redis Streams)
+  instrument_snapshot: Dict[symbol, Instrument]  # from local InstrumentRegistry (replicated from MDS)
   idempotency_key: str                        # for deduplication
   timestamp: datetime
 }
 ```
-**Purpose**: Encapsulates all data required for deterministic order execution WITHOUT external calls. Reduces non-determinism and latency variance.
+**Purpose**: Encapsulates all data required for deterministic order execution WITHOUT external calls. All snapshots are pre-cached; zero runtime network I/O beyond broker communication. Reduces non-determinism and latency variance.
+
+**Data Replication Sources**:
+- `quote_snapshot`: Updated via `market_data.quote.v1` Redis Streams consumer (real-time)
+- `instrument_snapshot`: Updated via InstrumentSyncService (snapshot bootstrap + 6h refresh from MDS)
 
 **Plane**: **EXECUTION** (synchronous, low latency)
 
 ---
 
-#### **Market Data Service (MDS)** — DATA PROVIDER
-**Responsibility**: Provide authoritative, real-time quotes and instrument metadata.
+#### **Market Data Service (MDS)** — DATA PROVIDER & AUTHORITATIVE SOURCE
+**Responsibility**: Provide authoritative, real-time quotes and instrument metadata. Orchestrate replication to all services.
 
 **MUST OWN**:
 - Quote distribution (Fyers real-time + Paper Broker mock quotes)
-- Instrument metadata (symbols, exchange, contract details, validation rules)
+- **Instrument master (authoritative source of truth)**
+  - Ingestion from brokers (Fyers, Paper, etc.)
+  - Normalization and validation (tick_size, lot_size, trading rules)
+  - Publishing via REST API (`GET /api/v1/instruments`) for bootstrap
+  - Publishing via events (`market_data.instrument_updated.v1`) for updates
 - Trading calendar (market open/close, holidays)
 - Quote publishing via Redis Streams (durable, ordered, idempotent)
 - WebSocket market data feeds to frontend (real-time tickers)
@@ -78,11 +88,15 @@ ExecutionContext {
 - ~~Execute orders~~ (BAS responsibility)
 - Call other services for trading decisions
 - Access BAS/PBS trading events (read-only RBAC violation)
+- Depend on replicated copies staying in sync (accept eventual consistency)
 
-**Data Ownership**:
-- Quotes (latest snapshot + stream history)
-- Instruments (metadata, validation rules)
-- Trading calendar
+**Data Ownership & Replication Model**:
+- Quotes (latest snapshot + stream history) — streaming only, not replicated
+- **Instruments (metadata, validation rules)** — authoritative source; intentionally replicated to all services
+  - Each service (BAS, PBS, Strategy, etc.) maintains local replicated copy via InstrumentSyncService
+  - Replication via snapshot bootstrap + periodic refresh (e.g., every 6 hours)
+  - Services use local replica during execution; zero runtime calls back to MDS
+- Trading calendar — replicated (low-frequency updates)
 
 **Plane**: **ASYNC/DATA** (event-driven publish)
 
@@ -471,23 +485,38 @@ BAS (publish order.filled.v1) → Redis Streams
 
 ---
 
-### Rule 2: BAS Data Provisioning (Pre-Caching + Fallback Rejection Model)
-**ALLOWED**: Local in-memory caches populated by asynchronous background processes
-- Quotes: In-memory cache (fed by `market_data.quote.v1` stream consumer)
-- Instruments: In-memory cache (preloaded at startup, refreshed every 6h)
-- Calendar: In-memory cache (updated hourly via background job)
+### Rule 2: BAS Data Provisioning (Replicated Reference Data + Pre-Caching Model)
+**ALLOWED**: Local in-memory caches populated by asynchronous background processes and replication services
+- **Quotes**: In-memory cache (fed by `market_data.quote.v1` stream consumer from MDS)
+- **Instruments**: Local replicated copy via `InstrumentSyncService`
+  - Snapshot bootstrap at startup from MDS (`GET /api/v1/instruments`)
+  - Periodic refresh every 6 hours (scheduled job)
+  - Stored in persistent InstrumentCache (survives restart)
+  - Loaded into in-memory InstrumentRegistry for <1ms lookups
+  - Optional event-driven updates via `market_data.instrument_updated.v1` (Phase 2)
+- **Calendar**: In-memory cache (updated hourly via background job)
 
 **NOT ALLOWED**: Synchronous REST calls to MDS during order execution  
 **Reason**: Execution path must have ZERO runtime dependency on MDS network availability  
-**Pattern**: Background refresh jobs ensure cache freshness; execution uses pre-cached data only  
+**Pattern**: 
+1. Background replication jobs keep local caches fresh
+2. Execution uses ONLY pre-cached data (in-memory lookups)
+3. Startup bootstrap ensures cache is warm before first order
 **Latency**: <1ms (in-memory lookup)
 
 **Cache Failure Policy** (Deterministic Fallback):
 - **If QuoteStore has no data for symbol**: Reject order with `quote_not_available` error
-- **If InstrumentCache missing symbol**: Reject order with `instrument_not_found` error
+- **If InstrumentRegistry missing symbol**: Reject order with `instrument_not_found` error
 - **If RiskLimits not cached**: Reject order with `risk_config_unavailable` error
 - **NO blocking network calls as fallback**; failure is immediate and deterministic
 - **Rationale**: Better to reject with known error than to incur latency variance from network calls
+
+**Instrument Master as Replicated Reference Data**:
+- MDS is authoritative source of truth (ingestion, normalization, validation rules)
+- Each service maintains identical local replica (intentional duplication, not eventual consistency)
+- Replicas are synchronized via InstrumentSyncService (smarttrade_common library)
+- Services never call MDS for instrument resolution; lookup from local InstrumentRegistry only
+- Staleness is detected and monitored; refresh can be triggered manually if needed
 
 ---
 
@@ -506,14 +535,19 @@ BAS (publish order.filled.v1) → Redis Streams
 ### Rule 3: BAS MUST NOT Call MDS During Execution
 **FORBIDDEN**: Any synchronous call from BAS to MDS during order execution  
 **Forbidden calls**:
-- `GET /api/v1/quotes/{symbol}`
-- `GET /api/v1/instruments/{symbol}`
-- `GET /api/v1/calendar`
+- `GET /api/v1/quotes/{symbol}` — use local QuoteStore from Redis Streams consumer
+- `GET /api/v1/instruments/{symbol}` — use local InstrumentRegistry (replicated via InstrumentSyncService)
+- `GET /api/v1/calendar` — use local cached trading calendar
 - Any REST call to MDS service
+- **Even with fallback**: Cache miss → reject order (do NOT call MDS as fallback)
 
-**Reason**: Adds unpredictable latency; execution must be deterministic  
+**Reason**: Adds unpredictable latency (50-500ms); execution must be deterministic (<100ms)  
 **Rationale**: All needed data must be pre-cached before order execution begins  
-**Pattern**: Background jobs refresh caches; execution reads from local cache only
+**Pattern**: 
+1. Background replication jobs (InstrumentSyncService, MarketDataConsumer) keep caches fresh
+2. Execution reads from local in-memory cache only
+3. No network I/O in execution path except broker call
+4. Cache miss → fast reject with clear error (not fallback network call)
 
 ---
 
@@ -943,12 +977,21 @@ InstrumentCache:
 GET    /api/v1/quotes/{symbol}              # Latest quote
 GET    /api/v1/quotes?symbols=NSE:INFY      # Multiple quotes
 
-GET    /api/v1/instruments                  # All instruments
-GET    /api/v1/instruments/{symbol}         # Instrument details
+GET    /api/v1/instruments                  # Full instrument master snapshot
+                                            # Used by InstrumentSyncService for bootstrap + refresh
+                                            # Returns: List[Instrument] with all metadata
+                                            
+GET    /api/v1/instruments/{symbol}         # Instrument details (optional, not used in execution path)
+GET    /api/v1/instruments/by-exchange/{exchange}  # All instruments for exchange
 
 GET    /api/v1/calendar                     # Trading calendar (cached)
 GET    /api/v1/calendar?exchange=NSE        # Calendar by exchange
 ```
+
+**Instrument Master Endpoint Behavior**:
+- `GET /api/v1/instruments` returns complete list with all fields (symbol, tick_size, lot_size, status, etc.)
+- Response includes version and checksum for staleness detection
+- Intended for batch replication (InstrumentSyncService bootstrap/refresh); not called per-order
 
 #### **Events Published**
 ```
@@ -1054,7 +1097,8 @@ strategy.paused.v1
 | Component | Current Location | Target Service | Readiness | Effort | Timeline |
 |-----------|---|---|---|---|---|
 | **Quote Cache** | `quote_store.py` | MDS (consume via Redis Streams) | Safe NOW | 6h | Phase 1 (Weeks 1-2) |
-| **Instrument Cache** | `instrument_cache.py` | MDS (REST + 24h TTL cache) | Safe NOW | 8h | Phase 1 (Weeks 1-2) |
+| **Instrument Cache** | `instrument_cache.py` | smarttrade_common (replicated reference data) | Safe NOW | 8h | Phase 1 (Weeks 1-2) |
+| **Instrument Master Replication** | *(to be added)* | smarttrade_common.instrument_master | Design Complete | 12-16h | Phase 1 (Weeks 1-2) |
 | **Action Logging** | `action_log_service.py` | Journal (event publishing) | Phased | 6h | Phase 4 (Weeks 7-8) |
 | **AutoEntry Logic** | `entry_service.py` | Strategy Service | Phased | 20h | Phase 2 (Weeks 3-4) |
 | **KillSwitch Logic** | `kill_switch_service.py` | Strategy Service | Phased | 18h | Phase 3 (Weeks 5-6) |
@@ -1063,18 +1107,44 @@ strategy.paused.v1
 
 ### Extraction Phases (5-Phase Strangler Pattern)
 
-#### **Phase 1: Market Data Caches** (Weeks 1-2, 8-12h)
-**Goal**: Remove local quote/instrument caches; consume from MDS
+#### **Phase 1: Market Data Caches & Instrument Master Replication** (Weeks 1-2, 20-28h)
+**Goal**: Implement replicated instrument master in smarttrade_common; migrate BAS and PBS to use it
 
 **Changes**:
-1. QuoteStore: Receive from `market_data.quote.v1` stream (not local updates)
-2. InstrumentCache: Replace with MDS REST calls + Redis cache (24h TTL)
-3. Stop MarketDataConsumer from writing to local caches
+1. **Implement smarttrade_common.instrument_master package** (12-16h)
+   - Canonical Instrument model
+   - InstrumentRegistry (in-memory fast lookup)
+   - InstrumentCache (persistent storage with versioning)
+   - InstrumentSyncService (bootstrap + periodic refresh)
+   - Shared validators (InstrumentValidator)
+   - Documentation + tests
 
-**Risk**: LOW (quote cache is lossy; missing quotes acceptable for risk validation)
-**Validation**: Quote availability in risk checks; instrument resolution latency
+2. **Update BAS to use replicated instrument master** (4-6h)
+   - Replace BAS InstrumentCache with InstrumentSyncService
+   - Bootstrap at startup
+   - Scheduled refresh (every 6 hours)
+   - Remove synchronous MDS calls in OrderHandler
+   - Add health check endpoint
 
-**Rollback**: Feature flag `BAS_QUOTE_SOURCE=local_cache`
+3. **Update PBS to use replicated instrument master** (2-4h)
+   - Use same InstrumentSyncService from smarttrade_common
+   - Validate fills respect tick_size, lot_size
+
+4. **Quote handling** (2-4h)
+   - QuoteStore: Receive from `market_data.quote.v1` stream (not local updates)
+   - Stop MarketDataConsumer from writing to local caches
+
+**Data Replication Model**:
+- Instruments: Replicated reference data (snapshot bootstrap + 6h refresh)
+- Quotes: Streamed (real-time, lossy acceptable)
+
+**Risk**: LOW (replicated reference data is a mature pattern; instruments change infrequently)
+**Validation**: 
+- Instrument lookup <1ms
+- No MDS calls during order execution
+- Bootstrap succeeds even if MDS unavailable (use previous cache)
+
+**Rollback**: Feature flag `BAS_INSTRUMENT_SOURCE=old_embedded_cache`
 
 ---
 

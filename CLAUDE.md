@@ -9,9 +9,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Purpose
 
 This repo holds:
-- **Architecture documents** — System-wide design (v3.4 current)
+- **Architecture documents** — System-wide design (current: `FINAL_TARGET_ARCHITECTURE_v4.0.md`)
 - **Cross-service design documents** — Features spanning 2+ services (in `design/cross-service/`)
-- **Planning & roadmaps** — Phased rollout strategies
+- **Active ADRs / shared-library designs** — e.g., the instrument-master trio.
+- **Roadmap** — cross-service direction (`ROADMAP.md`).
 
 Service-specific documentation lives in each service's own repository (see README for links).
 
@@ -19,21 +20,19 @@ Service-specific documentation lives in each service's own repository (see READM
 
 ```
 smarttrade-project/
+  FINAL_TARGET_ARCHITECTURE_v4.0.md     ← System architecture (source of truth)
+  ARCHITECTURE_DECISION_RECORD_instrument_master.md
+  DESIGN_smarttrade_common_instrument_master.md
+  IMPLEMENTATION_SUMMARY_instrument_master.md
   design/
-    cross-service/      ← Multi-service feature designs only
-  smarttrade-architecture-v3.4-current.md  ← Current architecture doc
-  README.md             ← Quick links to all documents & service repos
-  ROADMAP.md            ← Feature roadmap and timeline
-  CLAUDE.md             ← This file
+    cross-service/                      ← Multi-service feature designs
+  README.md                             ← Index / quick links
+  ROADMAP.md                            ← Cross-service roadmap
+  CLAUDE.md                             ← This file
 ```
 
-Service-specific documentation is maintained in each service repository:
-- `broker-adapter-service/docs/` — BAS implementation, LLDs, Fyers API reference
-- `market-data-service/docs/` — MDS implementation
-- `paper-broker-service/docs/` — Paper Broker Service implementation
-- `authentication-service/docs/` — Auth service documentation
-- `smarttrade-tests/docs/` — E2E testing strategy
-- `smarttrade-deployment/` — Infrastructure and deployment configuration
+Service-specific documentation is maintained in each service repository
+(see README.md for the full mapping).
 
 ## Design Document Workflow
 
@@ -93,7 +92,7 @@ If implementation reveals gaps, create a new design version:
 
 **In smarttrade-project**:
 - ✓ Cross-service designs → `design/cross-service/` (features spanning 2+ services)
-- ✓ Architecture documents → Repository root (e.g., `smarttrade-architecture-v3.4-current.md`)
+- ✓ Architecture documents → Repository root (current: `FINAL_TARGET_ARCHITECTURE_v4.0.md`)
 
 **In Service Repositories** (NOT in smarttrade-project):
 - ✓ Service-specific implementation docs → Service's own `docs/` directory
@@ -156,14 +155,22 @@ git add FEATURE && git commit -m "Design: Add FEATURE reference"
 
 All service-specific documentation is maintained in the service's own repository:
 
-- **Broker Adapter Service**: See `broker-adapter-service/docs/`
-  - Includes: Order State Machine, Execution Orchestrator, Outbox Pattern, Idempotency, Risk Engine
-  - Includes: Fyers API reference (complete API documentation)
-- **Market Data Service**: See `market-data-service/docs/`
-- **Paper Broker Service**: See `paper-broker-service/docs/`
-- **E2E Testing**: See `smarttrade-tests/docs/E2E_TESTING_STRATEGY.md`
+- **Broker Adapter Service**: See `broker-adapter-service/docs/` — stateless
+  execution kernel; broker adapter system, WebSocket account-event interface,
+  event-schema contracts, Fyers API reference.
+- **Market Data Service**: See `market-data-service/docs/` — target HLD,
+  WebSocket protocol, reconnect/replay architecture, auth strategy.
+- **Paper Broker Service**: See `paper-broker-service/docs/` — HLD (v4),
+  quote freshness model, MDS alignment.
+- **Journal / Portfolio / Strategy / Notification Services**: see each
+  service's own `CLAUDE.md` and (where present) `docs/`.
+- **Shared library**: See `smarttrade-common/docs/`.
+- **E2E Testing**: See `smarttrade-tests/docs/E2E_TESTING_STRATEGY.md`.
 
-These docs are the source of truth for implementation. Do not reference old/archived documentation.
+These docs are the source of truth for implementation. Components like the
+Order State Machine, Execution Orchestrator, Outbox Pattern, and in-BAS Risk
+Engine have been removed during the stateless refactor — do not implement
+against historical docs found in git history.
 
 ## Testing Strategy
 
@@ -201,5 +208,8 @@ A: No approval gate. Commit when confident. Fast feedback beats slow approval.
 **Q: Can services reference docs in smarttrade-project?**
 A: Yes, cross-service designs (via git submodule symlinks if needed). But service-specific docs must live in the service repo.
 
-**Q: I found outdated docs in an archive/. Should I use them?**
-A: No. Always use current docs in the service's active `docs/` directory. Archives are historical reference only.
+**Q: I found outdated docs in git history. Should I use them?**
+A: No. Always use current docs in each service's active `docs/` directory.
+Historical phase plans, completion reports, and LLDs for removed components
+have been deleted from the working tree; git history preserves them if you
+need to look them up.
