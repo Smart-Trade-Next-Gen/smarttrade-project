@@ -68,9 +68,9 @@ The Notification Service is a new microservice that provides asynchronous, event
 │                         SmartTrade Event Bus (Redis)                         │
 │  ┌──────────────────────────────────────────────────────────────────────┐  │
 │  │                    All Domain Events (with severity)                  │  │
-│  │  order.filled.v1 (severity: SUCCESS)                                  │  │
-│  │  trade.executed.v1 (severity: SUCCESS)                                │  │
-│  │  position.updated.v1 (severity: INFO)                                │  │
+│  │  order.filled (severity: SUCCESS)                                  │  │
+│  │  trade.executed (severity: SUCCESS)                                │  │
+│  │  position.updated (severity: INFO)                                │  │
 │  │  risk.limit_reached.v1 (severity: CRITICAL)                           │  │
 │  │  broker.connection.failed.v1 (severity: ERROR)                       │  │
 │  │  system.emergency.v1 (severity: CRITICAL)                             │  │
@@ -238,9 +238,9 @@ from pydantic import BaseModel, Field
 from smarttrade_common.events.schemas.domain.event_base import DomainEventBase
 
 class OrderPlacedV1(DomainEventBase):
-    """Schema for order.placed.v1 event."""
+    """Schema for order.placed event."""
     
-    event_type: str = "order.placed.v1"
+    event_type: str = "order.placed"
     version: str = "v1"
     
     # Event-specific fields
@@ -294,14 +294,14 @@ class EventCatalog:
     """Central catalog of all domain events with metadata."""
     
     EVENTS: Dict[str, dict] = {
-        "order.placed.v1": {
+        "order.placed": {
             "schema": OrderPlacedV1,
             "owner": "broker-adapter-service",
             "category": "TRADING",
             "default_severity": "INFO",
             "description": "Emitted when an order is placed with the broker",
         },
-        "order.filled.v1": {
+        "order.filled": {
             "schema": OrderFilledV1,
             "owner": "broker-adapter-service",
             "category": "TRADING",
@@ -376,7 +376,7 @@ event_data = OrderPlacedV1(
 
 # Prepare and publish
 prepared = publisher.prepare_event(
-    event_name="order.placed.v1",
+    event_name="order.placed",
     event_data=event_data,
     idempotency_key=f"order-{client_order_id}",
     metadata={
@@ -396,7 +396,7 @@ if not EventCatalog.validate_event_pattern("order.*"):
     raise ValueError("Invalid event pattern")
 
 # Get event metadata
-event_meta = EventCatalog.EVENTS.get("order.filled.v1")
+event_meta = EventCatalog.EVENTS.get("order.filled")
 category = event_meta["category"]
 default_severity = event_meta["default_severity"]
 
@@ -912,7 +912,7 @@ Response:
     {
       "notification_id": "uuid",
       "user_id": "uuid",
-      "event_name": "order.filled.v1",
+      "event_name": "order.filled",
       "severity": "SUCCESS",
       "category": "TRADING",
       "title": "Order Filled",
@@ -973,7 +973,7 @@ Server → Client (during replay):
   "type": "notification",
   "data": {
     "notification_id": "uuid",
-    "event_name": "order.filled.v1",
+    "event_name": "order.filled",
     "severity": "SUCCESS",
     "category": "TRADING",
     "title": "Order Filled",
@@ -1017,7 +1017,7 @@ Severity is now the responsibility of event publishers, not the notification ser
 **Examples**:
 - BAS publishes `risk.limit_reached.v1` with `severity: CRITICAL`
 - MDS publishes `broker.connection.failed.v1` with `severity: ERROR`
-- BAS publishes `order.filled.v1` with `severity: SUCCESS`
+- BAS publishes `order.filled` with `severity: SUCCESS`
 
 **Notification Service Behavior**:
 - Read severity directly from event envelope
@@ -1184,13 +1184,13 @@ await event_bus.publish(prepared.event_name, prepared.to_dict())
 ```
 
 **Events Published** (with severity):
-- `order.placed.v1` (severity: INFO)
+- `order.placed` (severity: INFO)
 - `order.accepted.v1` (severity: SUCCESS)
-- `order.filled.v1` (severity: SUCCESS)
-- `order.cancelled.v1` (severity: INFO)
-- `order.rejected.v1` (severity: ERROR)
-- `trade.executed.v1` (severity: SUCCESS)
-- `position.updated.v1` (severity: INFO)
+- `order.filled` (severity: SUCCESS)
+- `order.cancelled` (severity: INFO)
+- `order.rejected` (severity: ERROR)
+- `trade.executed` (severity: SUCCESS)
+- `position.updated` (severity: INFO)
 - `risk.warning.v1` (severity: WARNING)
 - `risk.limit_reached.v1` (severity: CRITICAL)
 - `risk.kill_switch_triggered.v1` (severity: CRITICAL)
@@ -1246,7 +1246,7 @@ await event_bus.publish(prepared.event_name, prepared.to_dict())
 ```python
 {
     "event_id": "uuid",
-    "event_name": "order.filled.v1",
+    "event_name": "order.filled",
     "event_version": "1.0",
     "user_id": "uuid",
     "trace_id": "uuid",
@@ -1464,17 +1464,17 @@ def match_subscription(event_name: str, event_pattern: str) -> bool:
     return fnmatch(event_name, event_pattern)
 
 # Examples:
-match_subscription("order.filled.v1", "order.*")  # True
+match_subscription("order.filled", "order.*")  # True
 match_subscription("risk.limit_reached.v1", "risk.*")  # True
-match_subscription("order.filled.v1", "order.filled.v1")  # True
-match_subscription("order.filled.v1", "trade.*")  # False
+match_subscription("order.filled", "order.filled")  # True
+match_subscription("order.filled", "trade.*")  # False
 ```
 
 **Subscription Examples**:
 - `"order.*"` - All order events
 - `"risk.*"` - All risk events
 - `"broker.connection.*"` - All broker connection events
-- `"trade.executed.v1"` - Specific event only
+- `"trade.executed"` - Specific event only
 
 ### Replay Architecture
 
@@ -1857,20 +1857,20 @@ async def test_unified_event_consumer():
 async def test_subscription_wildcard_matching():
     # Test wildcard pattern matching
     await subscription_service.create_subscription(user_id, "order.*", ["UI"])
-    has_subscription = await subscription_service.match_subscription(user_id, "order.filled.v1")
+    has_subscription = await subscription_service.match_subscription(user_id, "order.filled")
     assert has_subscription is True
 
 async def test_rate_limiting():
     # Test rate limit enforcement
     for i in range(105):
-        await rate_limiter.check_rate_limit(user_id, "order.filled.v1")
+        await rate_limiter.check_rate_limit(user_id, "order.filled")
     # 101st should be blocked
-    allowed = await rate_limiter.check_rate_limit(user_id, "order.filled.v1")
+    allowed = await rate_limiter.check_rate_limit(user_id, "order.filled")
     assert allowed is False
 
 async def test_template_rendering():
     # Test Jinja2 template rendering
-    title, message = template_service.render("order.filled.v1", {
+    title, message = template_service.render("order.filled", {
         "quantity": 10,
         "instrument_id": "NIFTY50-INDEX",
         "price": "21000.50"
@@ -1893,7 +1893,7 @@ async def test_template_rendering():
 ```python
 async def test_unified_event_flow():
     # Publish test event to event bus
-    await event_bus.publish("order.filled.v1", test_event_payload)
+    await event_bus.publish("order.filled", test_event_payload)
     # Wait for processing
     await asyncio.sleep(0.5)
     # Verify notification created with correct severity from envelope
@@ -2136,17 +2136,17 @@ async def test_websocket_auto_replay():
 **Broker Adapter Service**:
 ```python
 # Order events
-publish_event("order.placed.v1", severity="INFO")
+publish_event("order.placed", severity="INFO")
 publish_event("order.accepted.v1", severity="SUCCESS")
-publish_event("order.filled.v1", severity="SUCCESS")
-publish_event("order.cancelled.v1", severity="INFO")
-publish_event("order.rejected.v1", severity="ERROR")
+publish_event("order.filled", severity="SUCCESS")
+publish_event("order.cancelled", severity="INFO")
+publish_event("order.rejected", severity="ERROR")
 
 # Trade events
-publish_event("trade.executed.v1", severity="SUCCESS")
+publish_event("trade.executed", severity="SUCCESS")
 
 # Position events
-publish_event("position.updated.v1", severity="INFO")
+publish_event("position.updated", severity="INFO")
 
 # Risk events
 publish_event("risk.warning.v1", severity="WARNING")
@@ -2216,7 +2216,7 @@ Message: Connection to {{ broker_id }} failed. Error: {{ error_message }}
   "type": "notification",
   "data": {
     "notification_id": "uuid",
-    "event_name": "order.filled.v1",
+    "event_name": "order.filled",
     "severity": "SUCCESS",
     "category": "TRADING",
     "title": "Order Filled",

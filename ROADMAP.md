@@ -15,8 +15,8 @@ For the target architecture see
 | Authentication Service | Live |
 | Broker Adapter Service (BAS) | Live — stateless execution kernel (post-refactor: no local order/position/risk persistence) |
 | Market Data Service (MDS) | Live — Redis Streams + KV quote distribution, instrument master, option chain & Greeks |
-| Paper Broker Service (PBS) | Live — execution engine consumes real MDS prices via `market.quote.v1` |
-| Strategy Service | Live — consumes market + portfolio state, publishes `strategy.decision.v1` |
+| Paper Broker Service (PBS) | Live — execution engine consumes real MDS prices via `market.quote` |
+| Strategy Service | Live — consumes market + portfolio state, publishes `strategy.decision` |
 | Journal Service | Live — read-only event consumer; trades, orders, actions, FIFO open lots, journal entries |
 | Portfolio Service | Live — read-only event consumer; positions, holdings, portfolio summary with live valuation |
 | Notification Service | Live — user notification delivery |
@@ -40,13 +40,13 @@ plans.
   positions / holdings / portfolio summary moved to Portfolio Service.
 - **Strategy / Risk decoupling** — strategy logic and risk validation now
   live downstream of BAS.
-- **Quote distribution** — MDS publishes durable `market.quote.v1` Redis
+- **Quote distribution** — MDS publishes durable `market.quote` Redis
   Stream + KV snapshots; BAS, PBS, Portfolio, Strategy consume via consumer
   groups instead of WebSocket-direct.
 - **WebSocket separation** — MDS WS carries market data only; BAS WS
   carries account events. UI must not relay account events via MDS.
 - **Replicated instrument master** — MDS owns the master; other services
-  replicate locally and consume `market.instrument.v1` for updates. See
+  replicate locally and consume `market.instrument` for updates. See
   [`ARCHITECTURE_DECISION_RECORD_instrument_master.md`](ARCHITECTURE_DECISION_RECORD_instrument_master.md).
 
 ---
