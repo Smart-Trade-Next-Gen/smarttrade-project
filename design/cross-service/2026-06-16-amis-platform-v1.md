@@ -1,6 +1,6 @@
 # AMIS Platform Architecture - Final Approved Design
 
-**Document Version**: 2.0  
+**Document Version**: 2.1  
 **Date**: 2026-06-16  
 **Status**: Final Approved Architecture  
 **Scope**: Complete system architecture for AMIS Core, AMIS Lab, and SmartTrade UI AMIS Module  
@@ -204,6 +204,7 @@ smarttrade-amis-lab/
 smarttrade-ui/
 └── src/modules/amis/
     ├── dashboard/
+    ├── programs/
     ├── research/
     ├── validation/
     ├── governance/
@@ -483,7 +484,196 @@ class ResearchAsset(UUIDMixin, TimestampMixin, table=True):
 - evidence_references
 - semantic_version
 
-### 6.3 Promotion Service
+### 6.3 ExperimentArtifact (New First-Class Artifact)
+
+**Purpose**: Track experiments as searchable, versioned assets.
+
+**Examples**:
+- TRACK-RG16-GATING
+- TRACK-RG18-04C
+- TRACK-RG18-05
+
+**Data Model**:
+```python
+class ExperimentArtifact(UUIDMixin, TimestampMixin, table=True):
+    __tablename__ = "experiment_artifacts"
+    
+    experiment_name: str = Field(unique=True, index=True, nullable=False)
+    experiment_type: str = Field(nullable=False)  # HYPOTHESIS, VALIDATION, ABLATION
+    status: str = Field(default="EXPERIMENTAL", index=True)
+    
+    # Lab that performed the experiment
+    performing_lab: str = Field(nullable=False)
+    
+    # Opaque experiment definition (Lab owns the schema)
+    experiment_definition_json: dict = Field(sa_column=Column(JSON, nullable=False))
+    
+    # Results
+    results_json: Optional[dict] = Field(default=None, sa_column=Column(JSON))
+    conclusion: Optional[str] = Field(default=None)
+    
+    parent_artifact_ids: list = Field(sa_column=Column(JSON), default_factory=list)
+    semantic_version: str = Field(nullable=False)
+    
+    created_by: str = Field(nullable=False)
+    
+    extra_metadata: dict = Field(default_factory=dict, alias="metadata", sa_column=Column("metadata", JSON))
+```
+
+### 6.4 Candidate Registration (First-Class Artifact in Core)
+
+**Purpose**: Register Candidate in Core once created for governance lineage.
+
+**Data Model**:
+```python
+class CandidateArtifact(UUIDMixin, TimestampMixin, table=True):
+    __tablename__ = "candidate_artifacts"
+    
+    candidate_name: str = Field(unique=True, index=True, nullable=False)
+    research_group: str = Field(index=True, nullable=False)  # RG16, RG17, RG18
+    candidate_type: str = Field(nullable=False)  # ALPHA, PARTICIPATION, OPPORTUNITY
+    status: str = Field(default="DRAFT", index=True)
+    
+    feature_schema_id: Optional[UUID] = Field(default=None)
+    label_version_id: Optional[UUID] = Field(default=None)
+    base_model_id: Optional[UUID] = Field(default=None)
+    
+    # Lab that created the candidate
+    originating_lab: str = Field(nullable=False)
+    
+    semantic_version: str = Field(nullable=False)
+    
+    created_by: str = Field(nullable=False)
+    
+    extra_metadata: dict = Field(default_factory=dict, alias="metadata", sa_column=Column("metadata", JSON))
+```
+
+**Lineage Flow**:
+```text
+CandidateArtifact → ExperimentArtifact → Validation → ResearchAsset
+```
+
+### 6.5 Report Artifacts (Immutable in Core)
+
+**Purpose**: Promotion decisions must be traceable to the exact report version used.
+
+**Types**:
+- `ResearchReportArtifact`
+- `ValidationReportArtifact`
+- `RegimeReportArtifact`
+
+**Data Model**:
+```python
+class ReportArtifact(UUIDMixin, TimestampMixin, table=True):
+    __tablename__ = "report_artifacts"
+    
+    report_type: str = Field(index=True, nullable=False)  # RESEARCH, VALIDATION, REGIME
+    report_name: str = Field(nullable=False)
+    
+    # Content-addressable identity
+    report_hash: str = Field(unique=True, index=True, nullable=False)
+    semantic_version: str = Field(nullable=False)
+    
+    # Storage location
+    storage_backend: str = Field(default="filesystem", nullable=False)
+    storage_path: str = Field(nullable=False)
+    storage_size_bytes: int = Field(nullable=False)
+    storage_checksum: str = Field(nullable=False)
+    
+    # Linked artifacts
+    linked_artifact_ids: list = Field(sa_column=Column(JSON), default_factory=list)
+    
+    # Lab that generated the report
+    generating_lab: str = Field(nullable=False)
+    
+    created_by: str = Field(nullable=False)
+    
+    extra_metadata: dict = Field(default_factory=dict, alias="metadata", sa_column=Column("metadata", JSON))
+```
+
+### 6.6 Research Program Management (New in Core)
+
+**Purpose**: Drive R&D from UI. AMIS becomes a real R&D control tower.
+
+**Hierarchy**:
+```text
+ResearchProgram
+    ↓
+ResearchTrack
+    ↓
+ResearchMilestone
+```
+
+**Example**:
+```text
+Program: RG18
+    Track: Validation
+        Milestone: RG18-01 (Feature Engineering)
+        Milestone: RG18-02 (Model Training)
+        Milestone: RG18-03 (Walk-Forward)
+    Track: Envelope
+        Milestone: RG18-04 (VIX Threshold)
+        Milestone: RG18-05 (Dependency Health)
+    Track: Shadow
+        Milestone: RG18-06 (Shadow Launch)
+        Milestone: RG18-07 (Shadow Validation)
+```
+
+**Data Models**:
+
+```python
+class ResearchProgram(UUIDMixin, TimestampMixin, table=True):
+    __tablename__ = "research_programs"
+    
+    program_name: str = Field(unique=True, index=True, nullable=False)
+    description: Optional[str] = Field(default=None)
+    status: str = Field(default="ACTIVE", index=True)  # ACTIVE, FROZEN, COMPLETED
+    
+    lead_researcher: str = Field(nullable=False)
+    
+    created_by: str = Field(nullable=False)
+    
+    extra_metadata: dict = Field(default_factory=dict, alias="metadata", sa_column=Column("metadata", JSON))
+
+class ResearchTrack(UUIDMixin, TimestampMixin, table=True):
+    __tablename__ = "research_tracks"
+    
+    program_id: UUID = Field(foreign_key="research_programs.id", index=True)
+    track_name: str = Field(nullable=False)
+    description: Optional[str] = Field(default=None)
+    status: str = Field(default="ACTIVE", index=True)
+    
+    created_by: str = Field(nullable=False)
+    
+    extra_metadata: dict = Field(default_factory=dict, alias="metadata", sa_column=Column("metadata", JSON))
+
+class ResearchMilestone(UUIDMixin, TimestampMixin, table=True):
+    __tablename__ = "research_milestones"
+    
+    track_id: UUID = Field(foreign_key="research_tracks.id", index=True)
+    milestone_name: str = Field(nullable=False)
+    description: Optional[str] = Field(default=None)
+    status: str = Field(default="PENDING", index=True)  # PENDING, IN_PROGRESS, COMPLETED, BLOCKED
+    
+    # Linked artifacts
+    linked_artifact_ids: list = Field(sa_column=Column(JSON), default_factory=list)
+    
+    target_date: Optional[datetime] = Field(default=None)
+    completed_date: Optional[datetime] = Field(default=None)
+    
+    created_by: str = Field(nullable=False)
+    
+    extra_metadata: dict = Field(default_factory=dict, alias="metadata", sa_column=Column("metadata", JSON))
+```
+
+**API Endpoints**:
+- `POST /api/v1/programs` - Create research program
+- `GET /api/v1/programs` - List research programs
+- `POST /api/v1/programs/{id}/tracks` - Add track to program
+- `POST /api/v1/tracks/{id}/milestones` - Add milestone to track
+- `GET /api/v1/programs/{id}/status` - Get program status overview
+
+### 6.7 Promotion Service
 
 **Responsibilities**: Gate evaluation, promotion decisions, deployment orchestration
 
@@ -511,7 +701,7 @@ class ResearchAsset(UUIDMixin, TimestampMixin, table=True):
 - `GateDefinition` - Gate configuration
 - `GateEvaluation` - Gate evaluation result
 
-### 6.4 Gate Engine
+### 6.8 Gate Engine
 
 **Responsibilities**: Configurable gate definitions and evaluation logic
 
@@ -527,7 +717,7 @@ class ResearchAsset(UUIDMixin, TimestampMixin, table=True):
 - **Gate 2**: Shadow Validation - Shadow mode performance validation
 - **Gate 3**: Human Approval - Manual review and approval
 
-### 6.5 Artifact Lineage
+### 6.9 Artifact Lineage
 
 **Responsibilities**: Complete parent-child graph for all artifacts
 
@@ -537,11 +727,33 @@ class ResearchAsset(UUIDMixin, TimestampMixin, table=True):
 - Lineage visualization support
 - Impact analysis (what breaks if this artifact changes)
 
+**Core owns ALL lineage** — both research and operational.
+
+Lab generates artifacts. Core stores lineage.
+
 **Lineage Types**:
 - **Research Lineage**: FeatureSchema → Dataset → TrainingRun → ModelArtifact → PromotionDecision
 - **Operational Lineage**: DependencyDefinition → DependencyValidationRun → DependencyValidationSnapshot → DependencyIncident
 
-### 6.6 Audit Service
+**Unified Lineage Query**: Everything is queryable from one place in Core.
+
+```text
+FeatureSchema
+Dataset
+TrainingRun
+ModelArtifact
+ResearchAsset
+OperatingEnvelope
+DependencyDefinition
+DependencyValidationRun
+DependencyIncident
+PromotionDecision
+Candidate
+ExperimentArtifact
+ReportArtifact
+```
+
+### 6.10 Audit Service
 
 **Responsibilities**: Immutable audit log for all governance actions
 
@@ -551,7 +763,7 @@ class ResearchAsset(UUIDMixin, TimestampMixin, table=True):
 - User attribution
 - Query and export capabilities
 
-### 6.7 Deployment Governance
+### 6.11 Deployment Governance
 
 **Responsibilities**: Production deployment safety and rollback
 
@@ -566,6 +778,9 @@ class ResearchAsset(UUIDMixin, TimestampMixin, table=True):
 - `ProductionDeployment` - Production deployment tracking
 
 **OperatingEnvelopeVersion**:
+
+Core stores envelopes. Lab defines envelopes. Core never understands trading-specific concepts.
+
 ```python
 class OperatingEnvelopeVersion(UUIDMixin, TimestampMixin, table=True):
     __tablename__ = "operating_envelope_versions"
@@ -573,15 +788,11 @@ class OperatingEnvelopeVersion(UUIDMixin, TimestampMixin, table=True):
     envelope_name: str = Field(unique=True, index=True, nullable=False)
     semantic_version: str = Field(nullable=False)
     
-    # Operating conditions
-    vix_threshold: Optional[Decimal] = Field(default=None)
-    volatility_regime: Optional[str] = Field(default=None)
-    market_structure: Optional[str] = Field(default=None)
-    htf_alignment: Optional[str] = Field(default=None)
+    # Lab-defined envelope content (opaque to Core)
+    envelope_definition_json: dict = Field(sa_column=Column(JSON, nullable=False))
     
-    # Model requirements
-    min_rg16_score: Optional[Decimal] = Field(default=None)
-    min_regime_stability: Optional[Decimal] = Field(default=None)
+    # Lab that defined this envelope
+    defining_lab: str = Field(nullable=False)  # e.g., "amis-lab"
     
     status: str = Field(default="EXPERIMENTAL", index=True)
     
@@ -589,6 +800,8 @@ class OperatingEnvelopeVersion(UUIDMixin, TimestampMixin, table=True):
     
     extra_metadata: dict = Field(default_factory=dict, alias="metadata", sa_column=Column("metadata", JSON))
 ```
+
+**Core should never understand**: VIX, RG16, RG18, ATR, Compression, or any trading-specific concepts. Those belong in Lab.
 
 ---
 
@@ -726,7 +939,38 @@ src/modules/amis/
 - Shadow Validation Status
 - Promotion Queue
 
-### 8.3 Research Dashboard
+### 8.3 Programs Dashboard (R&D Control Tower)
+
+**Purpose**: Drive R&D from UI. Programs become the landing experience.
+
+**Display**:
+- Active Research Programs (e.g., RG16, RG18)
+- Program Status (Frozen, Active, Shadow Candidate)
+- Tracks per Program (Validation, Envelope, Shadow)
+- Milestones per Track
+- Blocked Milestones with reasons
+
+**Example View**:
+```text
+RG16
+  Status: FROZEN
+
+RG18
+  Status: Shadow Candidate
+  Track: Validation
+    Milestone: RG18-05 (Dependency Health) — BLOCKED by DEP-001
+
+Operations
+  Status: Blocked by DEP-001
+```
+
+**Key Features**:
+- Program creation and management
+- Track and milestone tracking
+- Program status overview
+- Drill-down to artifacts, validations, and deployments
+
+### 8.4 Research Dashboard
 
 **Purpose**: Research workflow orchestration
 
@@ -736,7 +980,7 @@ src/modules/amis/
 - Validation job monitoring
 - Research report generation
 
-### 8.4 Validation Dashboard
+### 8.5 Validation Dashboard
 
 **Purpose**: Validation monitoring and analysis
 
@@ -746,7 +990,7 @@ src/modules/amis/
 - Shadow validation monitoring
 - Performance metrics
 
-### 8.5 Governance Dashboard
+### 8.6 Governance Dashboard
 
 **Purpose**: Governance workflow management
 
@@ -756,7 +1000,7 @@ src/modules/amis/
 - Approval/rejection workflow
 - Rollback management
 
-### 8.6 Operations Dashboard
+### 8.7 Operations Dashboard
 
 **Purpose**: Operational health monitoring
 
@@ -766,7 +1010,7 @@ src/modules/amis/
 - Data reliability metrics
 - Alert configuration
 
-### 8.7 Lineage Explorer
+### 8.8 Lineage Explorer
 
 **Purpose**: Artifact lineage visualization
 
@@ -776,7 +1020,7 @@ src/modules/amis/
 - Impact analysis
 - Decision traceability
 
-### 8.8 Deployment Monitor
+### 8.9 Deployment Monitor
 
 **Purpose**: Production deployment monitoring
 
@@ -794,6 +1038,7 @@ src/modules/amis/
 
 ```mermaid
 erDiagram
+    %% Core Registry Entities
     feature_schemas ||--o{ datasets : "defines"
     label_versions ||--o{ datasets : "defines"
     stop_constraint_versions ||--o{ datasets : "constrains"
@@ -802,17 +1047,22 @@ erDiagram
     model_artifacts ||--o{ promotion_scorecards : "evaluates"
     promotion_scorecards ||--o{ promotion_decisions : "informs"
     research_assets ||--o{ promotion_decisions : "governs"
+    candidate_artifacts ||--o{ experiment_artifacts : "has"
+    candidate_artifacts ||--o{ validation_jobs : "validates"
+    experiment_artifacts ||--o{ model_artifacts : "produces"
+    report_artifacts ||--o{ promotion_scorecards : "supports"
+    operating_envelope_versions ||--o{ production_deployments : "defines"
+    research_programs ||--o{ research_tracks : "has"
+    research_tracks ||--o{ research_milestones : "contains"
     artifact_lineage ||--o{ model_artifacts : "parent"
     artifact_lineage ||--o{ model_artifacts : "child"
-    operating_envelope_versions ||--o{ production_deployments : "defines"
     
-    candidates ||--o{ experiments : "has"
-    candidates ||--o{ validation_jobs : "validates"
-    experiments ||--o{ model_artifacts : "produces"
+    %% Lab Research Entities
     validation_jobs ||--o{ promotion_scorecards : "generates"
     validation_jobs ||--o{ regime_analyses : "includes"
     validation_jobs ||--o{ vix_analyses : "includes"
     
+    %% Lab Operational Entities
     dependency_definitions ||--o{ dependency_validation_runs : "validates"
     dependency_definitions ||--o{ dependency_incidents : "has"
     dependency_validation_runs ||--o{ dependency_validation_snapshots : "captures"
@@ -835,6 +1085,41 @@ erDiagram
         list parent_artifact_ids
         list evidence_references
         str semantic_version
+    }
+    
+    candidate_artifacts {
+        UUID id PK
+        str candidate_name UK
+        str research_group
+        str candidate_type
+        str status
+        UUID feature_schema_id FK
+        UUID label_version_id FK
+        str originating_lab
+        str semantic_version
+    }
+    
+    experiment_artifacts {
+        UUID id PK
+        str experiment_name UK
+        str experiment_type
+        str status
+        str performing_lab
+        dict experiment_definition_json
+        dict results_json
+        list parent_artifact_ids
+        str semantic_version
+    }
+    
+    report_artifacts {
+        UUID id PK
+        str report_type
+        str report_name
+        str report_hash UK
+        str semantic_version
+        str storage_path
+        list linked_artifact_ids
+        str generating_lab
     }
     
     feature_schemas {
@@ -895,22 +1180,36 @@ erDiagram
         UUID id PK
         str envelope_name UK
         str semantic_version
-        decimal vix_threshold
-        str volatility_regime
-        str market_structure
-        str htf_alignment
-        decimal min_rg16_score
+        dict envelope_definition_json
+        str defining_lab
         str status
     }
     
-    candidates {
+    research_programs {
         UUID id PK
-        str candidate_name UK
-        str research_group
-        str candidate_type
+        str program_name UK
+        str description
         str status
-        UUID feature_schema_id FK
-        UUID label_version_id FK
+        str lead_researcher
+    }
+    
+    research_tracks {
+        UUID id PK
+        UUID program_id FK
+        str track_name
+        str description
+        str status
+    }
+    
+    research_milestones {
+        UUID id PK
+        UUID track_id FK
+        str milestone_name
+        str description
+        str status
+        list linked_artifact_ids
+        datetime target_date
+        datetime completed_date
     }
     
     validation_jobs {
@@ -1298,83 +1597,104 @@ class DependencyHealthResponse(BaseModel):
 
 ### 15.1 Priority 1: Core Foundation (Weeks 1-6)
 
-**Objective**: Establish AMIS Core and AMIS Lab foundation
+**Objective**: Establish AMIS Core governance foundation and AMIS Lab research foundation
 
-**Deliverables**:
+**Core Deliverables**:
 - smarttrade-common shared contracts (ResearchStatus, DependencyHealth, ArtifactReference)
-- AMIS Core Registry Service (including ResearchAsset)
-- AMIS Core Promotion Service
-- AMIS Core Gate Engine (including Gate 0)
-- AMIS Core Artifact Lineage
-- AMIS Core Audit Service
-- AMIS Lab Research Module
-- AMIS Lab Validation Module
-- AMIS Lab Operations Module
+- AMIS Core Registry Service (FeatureSchema, LabelVersion, Dataset, ModelArtifact)
+- AMIS Core ResearchAsset (first-class artifact)
+- AMIS Core ExperimentArtifact (experiment tracking)
+- AMIS Core Candidate Registration (candidate artifacts)
+- AMIS Core ResearchProgram / ResearchTrack / ResearchMilestone
+- AMIS Core Artifact Lineage (unified lineage authority)
+- AMIS Core Gate Engine (Gate definitions, evaluators)
 - Database schemas and migrations
 - Basic REST APIs
 - Integration with smarttrade-common
 
+**Lab Deliverables**:
+- AMIS Lab Candidate lifecycle management
+- AMIS Lab Validation framework
+- AMIS Lab Regime Analysis (VIX, Volatility, Market Structure, HTF Alignment)
+- AMIS Lab Dependency Validation
+
+**UI Deliverables**:
+- SmartTrade UI AMIS Module — Programs Dashboard (R&D Control Tower)
+
 **Success Criteria**:
 - ResearchAsset registration and retrieval
+- ExperimentArtifact registration and retrieval
+- Candidate artifact registration
+- ResearchProgram/Track/Milestone creation and tracking
 - Feature schema registration and retrieval
 - Dataset registration with lineage
 - Model artifact registration
-- Gate 0 evaluation framework
-- Dependency health monitoring
-- Incident management
+- Unified lineage query (research + operational)
+- Gate evaluation framework
+- Programs Dashboard displays RG16, RG18 status
 
-### 15.2 Priority 2: Operations API and Shadow Automation (Weeks 7-10)
+### 15.2 Priority 2: Operations Service Layer (Weeks 7-10)
 
-**Objective**: Complete operational capabilities and shadow validation
+**Objective**: Complete operational capabilities, Gate 0 enforcement, incident management
 
-**Deliverables**:
-- AMIS Lab Operations API
-- Shadow Validation Automation
-- Dependency Health Service
-- Data Reliability Monitoring
-- Shadow Validation Monitoring
-- Integration with AMIS Core Gate 0
+**Lab Deliverables**:
+- AMIS Lab Operations Module (full service layer)
+- Gate 0 enforcement (dependency health → promotion blocking)
+- Incident Management (lifecycle, escalation)
+- Dependency Monitoring (health checks, status aggregation)
+- Data Reliability Monitoring (quality, gaps, latency)
+
+**Core Deliverables**:
+- AMIS Core Audit Service (immutable audit log)
+- Gate 0 integration (consume dependency health from Lab)
 
 **Success Criteria**:
 - Dependency health API
-- Shadow validation automation
+- Incident creation and tracking
+- Gate 0 blocking logic (no overrides)
 - Data reliability metrics
-- Gate 0 blocking logic
+- Audit log for all governance actions
 
-### 15.3 Priority 3: SmartTrade UI AMIS Module (Weeks 11-14)
+### 15.3 Priority 3: Promotion Workflows and Deployment Governance (Weeks 11-14)
 
-**Objective**: Build AMIS module inside SmartTrade UI
+**Objective**: Complete promotion, deployment, and UI workflows
 
-**Deliverables**:
+**Core Deliverables**:
+- AMIS Core Promotion Service (full promotion workflow)
+- AMIS Core Deployment Governance (operating envelopes, deployments, rollback)
+- AMIS Core Report Artifacts (ResearchReport, ValidationReport, RegimeReport)
+
+**UI Deliverables**:
 - AMIS Dashboard (Mission Control)
 - Research Dashboard
 - Validation Dashboard
-- Governance Dashboard
+- Governance Dashboard (promotion center)
 - Operations Dashboard
 - Lineage Explorer
 - Deployment Monitor
 
 **Success Criteria**:
-- AMIS Dashboard as default landing page
-- All research workflows accessible via UI
-- Promotion workflow end-to-end
-- Operational monitoring dashboards
+- Full promotion workflow end-to-end
+- Deployment orchestration with operating envelopes
+- Report artifacts registered and retrievable
+- All dashboards functional
 - Lineage visualization
+- Rollback capability
 
 ### 15.4 Priority 4: RG18 Live Validation (Weeks 15-18)
 
 **Objective**: Complete RG18 live validation and promotion
 
 **Deliverables**:
-- RG18 Operating Envelope definition
-- RG18 live validation
+- RG18 Operating Envelope definition (Lab) and registration (Core)
+- RG18 shadow validation automation
 - RG18 promotion workflow
 - TRACK-RG18-05 completion
 
 **Success Criteria**:
-- RG18 Operating Envelope registered
-- RG18 live validation complete
-- RG18 promotion ready (pending dependency health)
+- RG18 Operating Envelope registered in Core
+- RG18 shadow validation complete
+- RG18 promotion ready (pending dependency health + Gate 0)
 
 **No new alpha research should begin until the operational platform is complete.**
 
