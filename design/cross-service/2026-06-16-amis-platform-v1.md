@@ -1,6 +1,6 @@
 # AMIS Platform Architecture - Final Approved Design
 
-**Document Version**: 2.1  
+**Document Version**: 2.2  
 **Date**: 2026-06-16  
 **Status**: Final Approved Architecture  
 **Scope**: Complete system architecture for AMIS Core, AMIS Lab, and SmartTrade UI AMIS Module  
@@ -438,13 +438,64 @@ All shared enums and contracts must live in smarttrade-common.
 - `GET /api/v1/registry/lineage/{artifact_id}` - Get artifact lineage
 
 **Data Models**:
+- `ResearchContext` - Research context contract (NEW)
 - `FeatureSchema` - Feature schema definitions
 - `LabelVersion` - Label computation versions
 - `StopConstraintVersion` - Stop constraint parameter versions
 - `Dataset` - Training dataset registry
 - `TrainingRun` - Training run registry
 - `ModelArtifact` - Model artifact registry
-- `ResearchAsset` - Research asset registry (NEW)
+- `ResearchAsset` - Research asset registry
+
+**ResearchContext Model** (Root of Research Lineage):
+
+```python
+class ResearchContext(UUIDMixin, TimestampMixin, table=True):
+    __tablename__ = "research_contexts"
+    
+    semantic_version: str = Field(nullable=False)
+    
+    # Instrument and timeframe context
+    instrument_ids: list = Field(sa_column=Column(JSON, nullable=False))
+    primary_timeframe: str = Field(nullable=False)
+    higher_timeframe: str = Field(nullable=False)
+    
+    # VIX constraints
+    vix_required: bool = Field(default=False, nullable=False)
+    vix_min: Optional[Decimal] = Field(default=None)
+    vix_max: Optional[Decimal] = Field(default=None)
+    
+    # Regime dimensions
+    volatility_regimes: list = Field(sa_column=Column(JSON), default_factory=list)
+    market_structures: list = Field(sa_column=Column(JSON), default_factory=list)
+    session_filters: list = Field(sa_column=Column(JSON), default_factory=list)
+    
+    # Context hash for immutability
+    context_hash: str = Field(unique=True, index=True, nullable=False)
+    
+    # Provenance
+    created_by: str = Field(nullable=False)
+    notes: Optional[str] = Field(default=None)
+    
+    extra_metadata: dict = Field(default_factory=dict, alias="metadata", sa_column=Column("metadata", JSON))
+```
+
+**Example ResearchContext**:
+```json
+{
+  "instrument_ids": ["NSE:CASH:INDEX:NIFTY50"],
+  "primary_timeframe": "1H",
+  "higher_timeframe": "4H",
+  "vix_required": true,
+  "vix_min": 0,
+  "vix_max": 15,
+  "volatility_regimes": ["LOW"],
+  "market_structures": ["RANGING", "COMPRESSION"],
+  "session_filters": []
+}
+```
+
+**Purpose**: ResearchContext is an immutable contract that captures the exact market conditions under which an artifact was validated. It becomes the root of research and deployment lineage. All downstream artifacts must reference a ResearchContext to ensure deployment context matches validated context.
 
 ### 6.2 ResearchAsset (New First-Class Artifact)
 
@@ -732,25 +783,30 @@ class ResearchMilestone(UUIDMixin, TimestampMixin, table=True):
 Lab generates artifacts. Core stores lineage.
 
 **Lineage Types**:
-- **Research Lineage**: FeatureSchema → Dataset → TrainingRun → ModelArtifact → PromotionDecision
+- **Research Lineage**: ResearchContext → FeatureSchema → Dataset → TrainingRun → ModelArtifact → PromotionDecision
+- **Deployment Lineage**: ResearchContext → OperatingEnvelopeVersion → ShadowValidationRun → ProductionDeployment
 - **Operational Lineage**: DependencyDefinition → DependencyValidationRun → DependencyValidationSnapshot → DependencyIncident
 
 **Unified Lineage Query**: Everything is queryable from one place in Core.
 
 ```text
-FeatureSchema
-Dataset
-TrainingRun
-ModelArtifact
-ResearchAsset
-OperatingEnvelope
-DependencyDefinition
-DependencyValidationRun
-DependencyIncident
-PromotionDecision
-Candidate
-ExperimentArtifact
-ReportArtifact
+ResearchContext
+  ├── FeatureSchema
+  ├── Dataset
+  ├── TrainingRun
+  ├── ModelArtifact
+  ├── ResearchAsset
+  ├── OperatingEnvelopeVersion
+  ├── ShadowValidationRun
+  ├── ProductionDeployment
+  ├── CandidateArtifact
+  ├── ExperimentArtifact
+  ├── ReportArtifact
+  ├── DependencyDefinition
+  ├── DependencyValidationRun
+  ├── DependencyValidationSnapshot
+  ├── DependencyIncident
+  └── PromotionDecision
 ```
 
 ### 6.10 Audit Service
@@ -790,6 +846,9 @@ class OperatingEnvelopeVersion(UUIDMixin, TimestampMixin, table=True):
     
     # Lab-defined envelope content (opaque to Core)
     envelope_definition_json: dict = Field(sa_column=Column(JSON, nullable=False))
+    
+    # Research Context this envelope was validated under
+    research_context_id: UUID = Field(foreign_key="research_contexts.id", index=True, nullable=False)
     
     # Lab that defined this envelope
     defining_lab: str = Field(nullable=False)  # e.g., "amis-lab"
@@ -934,6 +993,8 @@ src/modules/amis/
 - Research Assets
 - Production Candidates
 - Production Models
+- Research Contexts
+- Context Compatibility Status
 - Open Incidents
 - Dependency Health
 - Shadow Validation Status
@@ -1028,7 +1089,17 @@ Operations
 - Current production artifact
 - Deployment history
 - Operating envelope status
+- **Research Context compatibility status**
+- **Context match/difference display**
+- **Deployment blocking on context mismatch**
 - Rollback status
+
+**Context Display**:
+- Validated Research Context (instrument, timeframes, VIX, regimes, structures)
+- Deployment Target Context
+- Context match/mismatch indicators
+- Specific field differences (if any)
+- Block reason if context incompatible
 
 ---
 
@@ -1039,6 +1110,13 @@ Operations
 ```mermaid
 erDiagram
     %% Core Registry Entities
+    research_contexts ||--o{ feature_schemas : "context"
+    research_contexts ||--o{ datasets : "context"
+    research_contexts ||--o{ training_runs : "context"
+    research_contexts ||--o{ model_artifacts : "context"
+    research_contexts ||--o{ operating_envelope_versions : "context"
+    research_contexts ||--o{ candidate_artifacts : "context"
+    research_contexts ||--o{ experiment_artifacts : "context"
     feature_schemas ||--o{ datasets : "defines"
     label_versions ||--o{ datasets : "defines"
     stop_constraint_versions ||--o{ datasets : "constrains"
@@ -1067,11 +1145,28 @@ erDiagram
     dependency_definitions ||--o{ dependency_incidents : "has"
     dependency_validation_runs ||--o{ dependency_validation_snapshots : "captures"
     
+    research_contexts {
+        UUID id PK
+        str semantic_version
+        list instrument_ids
+        str primary_timeframe
+        str higher_timeframe
+        bool vix_required
+        decimal vix_min
+        decimal vix_max
+        list volatility_regimes
+        list market_structures
+        list session_filters
+        str context_hash UK
+        str notes
+    }
+    
     model_artifacts {
         UUID id PK
         str artifact_hash UK
         str semantic_version
         UUID training_run_id FK
+        UUID research_context_id FK
         dict hyperparameters
         dict training_metrics
         str status
@@ -1093,6 +1188,7 @@ erDiagram
         str research_group
         str candidate_type
         str status
+        UUID research_context_id FK
         UUID feature_schema_id FK
         UUID label_version_id FK
         str originating_lab
@@ -1143,6 +1239,7 @@ erDiagram
         UUID id PK
         str dataset_hash UK
         str semantic_version
+        UUID research_context_id FK
         UUID feature_schema_id FK
         UUID label_version_id FK
         UUID stop_constraint_version_id FK
@@ -1180,6 +1277,7 @@ erDiagram
         UUID id PK
         str envelope_name UK
         str semantic_version
+        UUID research_context_id FK
         dict envelope_definition_json
         str defining_lab
         str status
@@ -1335,7 +1433,31 @@ DependencyIncident
 
 **No overrides.**
 
-### 10.2 Gate 1: Research Validation
+### 10.2 Gate 1: Context Compatibility (MANDATORY)
+
+**Purpose**: Prevent deployment of research artifacts into environments that differ from the validated research context
+
+**Definition**: Deployment context must match validated Research Context
+
+**Gate 1 consumes**: Research Context from AMIS Core Registry, Deployment target context
+
+**Evaluation Criteria**:
+- `instrument_ids`: Deployment instrument must exist in validated research context
+- `primary_timeframe`: Exact match required between research and deployment
+- `higher_timeframe`: Exact match required between research and deployment
+- `vix_required`: Deployment must enforce validated VIX constraints
+- `vix_min`: Deployment value must be within validated range
+- `vix_max`: Deployment value must be within validated range
+- `volatility_regimes`: Deployment must not expand beyond validated regimes
+- `market_structures`: Deployment must not expand beyond validated structures
+
+**If Gate 1 fails**: Promotion Blocked
+
+**No overrides.**
+
+**Example failure**: Model validated on NIFTY 1H with VIX<15 cannot be deployed on BANKNIFTY 15m without VIX constraints.
+
+### 10.3 Gate 2: Research Validation
 
 **Purpose**: Research validation and regime analysis
 
@@ -1346,7 +1468,7 @@ DependencyIncident
 - **Mandatory Regime Governance**: India VIX, Volatility, Market Structure, HTF Alignment analysis included and significant
 - Baseline comparison passed (beats current production)
 
-### 10.3 Gate 2: Shadow Validation
+### 10.4 Gate 3: Shadow Validation
 
 **Purpose**: Shadow mode performance validation
 
@@ -1358,7 +1480,7 @@ DependencyIncident
 - No significant drift vs production
 - Cross-instrument lift > 0
 
-### 10.4 Gate 3: Human Approval
+### 10.5 Gate 4: Human Approval
 
 **Purpose**: Manual review and approval
 
@@ -1902,6 +2024,51 @@ Gate 0 must pass before all promotion decisions:
 - [ ] Dependency health validated within last 24 hours
 
 **No overrides.**
+
+## Appendix E: Gate 1 (Context Compatibility) Compliance Checklist
+
+Gate 1 must pass before all promotion decisions:
+
+- [ ] Deployment instrument exists in validated Research Context
+- [ ] Primary timeframe matches exactly
+- [ ] Higher timeframe matches exactly
+- [ ] VIX required flag matches
+- [ ] Deployment VIX range within validated range
+- [ ] Volatility regimes within validated set
+- [ ] Market structures within validated set
+- [ ] Research Context is immutable and referenced by artifact
+
+**No overrides.**
+
+## Appendix F: RULE-008 Context Preservation
+
+**Rule ID**: RULE-008  
+**Title**: Context Preservation  
+**Definition**: No artifact may be promoted, shadow deployed, or production deployed if deployment context differs from validated research context.
+
+**Context Dimensions**:
+- Instrument
+- Primary Timeframe
+- Higher Timeframe
+- VIX Constraints
+- Volatility Regime
+- Market Structure
+
+**Enforcement**: Automatic failure at Gate 1 (Context Compatibility Gate)
+
+**Example**: A model validated on NIFTY 1H with HTF=4H and VIX<15 cannot generate correct signals if deployed on BANKNIFTY 15m or without VIX constraints.
+
+## Appendix G: Acceptance Criteria
+
+- [ ] ResearchContext is a first-class registry artifact in AMIS Core
+- [ ] All promoted artifacts reference a ResearchContext
+- [ ] Context Compatibility Gate (Gate 1) blocks mismatched deployments
+- [ ] UI displays validated research context for every artifact
+- [ ] Operating Envelopes reference Research Context
+- [ ] Promotion workflow includes Context Compatibility Gate
+- [ ] RG16 and RG18 artifacts migrated to Research Context model
+- [ ] Deployment page shows context match status and differences
+- [ ] Deployment blocked if context mismatch detected
 
 ---
 
