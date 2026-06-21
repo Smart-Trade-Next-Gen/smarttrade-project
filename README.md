@@ -37,7 +37,8 @@ documentation lives in each service's own repository.
 | Notification Service | [`../notification-service/`](../notification-service/) |
 | Authentication Service | [`../authentication-service/`](../authentication-service/) |
 | User Setting Service | [`../user-setting-service/`](../user-setting-service/) |
-| AI Service | [`../ai-service/`](../ai-service/) |
+| AMIS Core Service | [`../smarttrade-amis-core/`](../smarttrade-amis-core/) |
+| AMIS Lab Service | [`../smarttrade-amis-lab/`](../smarttrade-amis-lab/) |
 | Frontend | [`../smarttrade-frontend/`](../smarttrade-frontend/) |
 | Shared library | [`../smarttrade-common/docs/`](../smarttrade-common/docs/) |
 | Deployment | [`../smarttrade-deployment/`](../smarttrade-deployment/) |
@@ -57,6 +58,8 @@ documentation lives in each service's own repository.
 | Journal Service | 8007 | `smarttrade_journal_service` |
 | Portfolio Service | 8008 | `smarttrade_portfolio_service` |
 | Notification Service | 8011 | `smarttrade_notification_service` |
+| AMIS Core Service | 8000 | `smarttrade_amis_core` |
+| AMIS Lab Service | 8016 | `smarttrade_amis_lab` |
 | Frontend | 5173 | — |
 
 ## When to look where
